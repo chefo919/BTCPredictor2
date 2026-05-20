@@ -19,7 +19,7 @@ try:
 except RuntimeError:
     pass  # already initialized (e.g. imported after another TF module)
 
-from features.engineer import FEATURE_COLS
+from features.engineer import FEATURE_COLS, get_feature_groups
 from models import tft_model, bilstm_model, meta_model
 
 ROOT        = os.path.dirname(os.path.dirname(__file__))
@@ -98,19 +98,14 @@ def run_training(force: bool = False, test_mode: bool = False):
         df = df.tail(10000).copy()
         print(f"[TEST MODE] Limiting to last {len(df):,} rows, 3 epochs.", flush=True)
 
-    # ── Load selected features (from select_features.py) if available ─────────
-    import json as _json
-    _sel_path = os.path.join(ROOT, "models", "saved", "selected_features.json")
-    if os.path.exists(_sel_path):
-        with open(_sel_path) as _f:
-            _sel = _json.load(_f)
-        ACTIVE_FEATURES = _sel["selected"]
-        print(f"[Training] Feature selection: {len(ACTIVE_FEATURES)} / {len(FEATURE_COLS)} features", flush=True)
-    else:
-        ACTIVE_FEATURES = FEATURE_COLS
-        print(f"[Training] No feature selection file — using all {len(FEATURE_COLS)} features", flush=True)
+    # ── Feature groups — each model gets a specialized subset ────────────────
+    groups           = get_feature_groups()
+    BILSTM_FEATURES  = groups["bilstm"]        # 1m/15m/30m — 30 features
+    TFT_DYN_FEATURES = groups["tft_dynamic"]   # h1/h4/d1   — 30 features
+    TFT_STA_FEATURES = groups["tft_static"]    # w1/mo1     — 27 features
+    ALL_NEEDED       = BILSTM_FEATURES + TFT_DYN_FEATURES + TFT_STA_FEATURES
 
-    n_clean = len(df.dropna(subset=ACTIVE_FEATURES))
+    n_clean = len(df.dropna(subset=ALL_NEEDED))
     t0      = time.time()
 
     SEP = "=" * 46
@@ -118,8 +113,8 @@ def run_training(force: bool = False, test_mode: bool = False):
     print(SEP)
     print("TFT-ACB-XML STACKING TRAINING (arXiv 2602.12380)")
     print(SEP)
-    print(f"Phase 1/3: TFT  (macro, SEQ_LEN={tft_model.SEQ_LEN}, D_MODEL={tft_model.D_MODEL})")
-    print(f"Phase 2/3: BiLSTM (momentum, SEQ_LEN={bilstm_model.SEQ_LEN})")
+    print(f"Phase 1/3: TFT  (macro, SEQ_LEN={tft_model.SEQ_LEN}, dynamic={len(TFT_DYN_FEATURES)}, static={len(TFT_STA_FEATURES)})")
+    print(f"Phase 2/3: BiLSTM/ACB (micro, SEQ_LEN={bilstm_model.SEQ_LEN}, features={len(BILSTM_FEATURES)})")
     print(f"Phase 3/3: XGBoost meta-learner (error-reciprocal weighting)")
     print(f"Training rows:   {n_clean:,}")
     print(f"Target:          price direction {tft_model.HORIZON} minutes ahead")
@@ -143,47 +138,51 @@ def run_training(force: bool = False, test_mode: bool = False):
         tft_val_err = 1.0 - _saved_acc.get("tft_val", tft_acc)
         print(f"[1/3] TFT already trained — skipping  (saved acc: {tft_acc:.3f})")
     else:
-        print("[1/3] Training Adaptive TFT (macro cycles, SEQ_LEN=60)...")
+        print(f"[1/3] Training TFT (macro, SEQ_LEN={tft_model.SEQ_LEN}, HORIZON={tft_model.HORIZON})...")
         t_tft       = time.time()
-        tft_results = tft_model.train(df, ACTIVE_FEATURES)
+        tft_results = tft_model.train(df, TFT_DYN_FEATURES, TFT_STA_FEATURES)
         tft_elapsed = time.time() - t_tft
         tft_acc     = tft_results["test_acc"]
         tft_val_err = 1.0 - tft_results.get("val_acc", tft_acc)
         print(f"\nTFT complete | Accuracy: {tft_acc:.3f} | Val error: {tft_val_err:.4f} | Time: {_fmt(tft_elapsed)}")
     print()
 
-    # ── Phase 2: Train BiLSTM on 70% ─────────────────────────────────────────
+    # ── Phase 2: Train BiLSTM/ACB ─────────────────────────────────────────────
     if bilstm_model.is_trained():
         bilstm_acc     = _saved_acc.get("bilstm", 0.51)
         bilstm_val_err = 1.0 - _saved_acc.get("bilstm_val", bilstm_acc)
         print(f"[2/3] BiLSTM already trained — skipping  (saved acc: {bilstm_acc:.3f})")
     else:
-        print("[2/3] Training BiLSTM/ACB (short-term momentum, SEQ_LEN=30)...")
+        print(f"[2/3] Training BiLSTM/ACB (micro, SEQ_LEN={bilstm_model.SEQ_LEN}, HORIZON={bilstm_model.HORIZON})...")
         t_bilstm       = time.time()
-        bilstm_results = bilstm_model.train(df, ACTIVE_FEATURES)
+        bilstm_results = bilstm_model.train(df, BILSTM_FEATURES)
         bilstm_elapsed = time.time() - t_bilstm
         bilstm_acc     = bilstm_results["test_acc"]
         bilstm_val_err = 1.0 - bilstm_results.get("val_acc", bilstm_acc)
         print(f"\nBiLSTM complete | Accuracy: {bilstm_acc:.3f} | Val error: {bilstm_val_err:.4f} | Time: {_fmt(bilstm_elapsed)}")
     print()
 
-    # ── Phase 3: Generate OOF predictions on 15% val slice → train meta ──────
+    # ── Phase 3: OOF predictions → train meta ────────────────────────────────
     print("[3/3] Generating OOF predictions and training XGBoost meta-learner...")
-    n_total = len(df.dropna(subset=ACTIVE_FEATURES))
+    df_clean  = df.dropna(subset=ALL_NEEDED).reset_index(drop=True)
+    n_total   = len(df_clean)
     val_start = int(n_total * 0.70)
     val_end   = int(n_total * 0.85)
-    df_clean  = df.dropna(subset=ACTIVE_FEATURES).reset_index(drop=True)
     df_val    = df_clean.iloc[val_start:val_end].copy()
 
-    val_X = df_val[ACTIVE_FEATURES].values.astype("float32")
+    val_X_dyn  = df_val[TFT_DYN_FEATURES].values.astype("float32")
+    val_X_sta  = df_val[TFT_STA_FEATURES].values.astype("float32")
+    val_X_bi   = df_val[BILSTM_FEATURES].values.astype("float32")
+
     print(f"  Generating TFT OOF predictions on {len(df_val):,} rows...", flush=True)
-    val_tft_probs    = tft_model.predict_proba_batch(val_X, ACTIVE_FEATURES)
+    val_tft_probs    = tft_model.predict_proba_batch(val_X_dyn, val_X_sta)
     print(f"  Generating BiLSTM OOF predictions on {len(df_val):,} rows...", flush=True)
-    val_bilstm_probs = bilstm_model.predict_proba_batch(val_X, ACTIVE_FEATURES)
+    val_bilstm_probs = bilstm_model.predict_proba_batch(val_X_bi)
 
     t_meta       = time.time()
     meta_results = meta_model.train(df_val, val_tft_probs, val_bilstm_probs,
-                                     tft_val_err, bilstm_val_err, ACTIVE_FEATURES)
+                                     tft_val_err, bilstm_val_err,
+                                     TFT_DYN_FEATURES + TFT_STA_FEATURES)
     meta_elapsed = time.time() - t_meta
     print(f"\nMeta-learner complete | Train acc: {meta_results['train_acc']:.3f} | "
           f"Time: {_fmt(meta_elapsed)}")

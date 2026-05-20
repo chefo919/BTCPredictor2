@@ -19,16 +19,15 @@ import tensorflow as tf
 tf.get_logger().setLevel("ERROR")
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
-from features.engineer import FEATURE_COLS
-
-import json as _json
-_sel_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models", "saved", "selected_features.json")
-ACTIVE_FEATURES = (_json.load(open(_sel_path))["selected"]
-                   if os.path.exists(_sel_path) else FEATURE_COLS)
-
-from models.tft_model    import GRN, VSN, SEQ_LEN as SEQ_TFT
-from models.bilstm_model import _SumPool
+from features.engineer import FEATURE_COLS, get_feature_groups
+from models.tft_model    import GRN, VSN, _StaticGRN, SEQ_LEN as SEQ_TFT
+from models.bilstm_model import _SumPool, _PVAttention
 from models import bilstm_model as _bilstm_mod, meta_model as _meta_mod
+
+_groups          = get_feature_groups()
+BILSTM_FEATURES  = _groups["bilstm"]
+TFT_DYN_FEATURES = _groups["tft_dynamic"]
+TFT_STA_FEATURES = _groups["tft_static"]
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 ROOT          = os.path.dirname(os.path.dirname(__file__))
@@ -63,9 +62,11 @@ def _load_models():
             sys.exit(1)
 
     print("[Backtest] Loading TFT-ACB-XML models...", flush=True)
-    tft_m    = tf.keras.models.load_model(tft_path, custom_objects={"GRN": GRN, "VSN": VSN})
+    tft_m    = tf.keras.models.load_model(tft_path,
+                   custom_objects={"GRN": GRN, "VSN": VSN, "_StaticGRN": _StaticGRN})
     tft_s    = joblib.load(tft_s_path)
-    bilstm_m = tf.keras.models.load_model(bi_path, custom_objects={"_SumPool": _SumPool})
+    bilstm_m = tf.keras.models.load_model(bi_path,
+                   custom_objects={"_SumPool": _SumPool, "_PVAttention": _PVAttention})
     bilstm_s = joblib.load(bi_s_path)
     meta_m   = joblib.load(meta_path)["model"]
     meta_w   = joblib.load(meta_path)["weights"]
@@ -76,14 +77,16 @@ def _load_models():
 
 # ── Batch inference ───────────────────────────────────────────────────────────
 
-def _batch_infer(X_all, times_all, first_idx, tft_m, tft_s, bilstm_m, bilstm_s, meta_m, meta_w, df):
-    n         = len(X_all) - first_idx
-    n_batches = (n + INFER_BATCH - 1) // INFER_BATCH
+def _batch_infer(X_tft_dyn, X_tft_sta, X_bi, times_all, first_idx,
+                  tft_m, tft_s, bilstm_m, bilstm_s, meta_m, meta_w, df):
+    n          = len(X_tft_dyn) - first_idx
+    n_batches  = (n + INFER_BATCH - 1) // INFER_BATCH
     SEQ_BILSTM = _bilstm_mod.SEQ_LEN
 
-    # ── TFT inference ────────────────────────────────────────────────────────
+    # ── TFT inference (dynamic + static concatenated for scaler) ─────────────
     print("[Backtest] Running TFT inference...", flush=True)
-    tft_sc    = tft_s.transform(X_all).astype(np.float32)
+    X_tft_all = np.concatenate([X_tft_dyn, X_tft_sta], axis=1)
+    tft_sc    = tft_s.transform(X_tft_all).astype(np.float32)
     tft_probs = np.full(n, 0.5, dtype=np.float32)
     last_pct  = -1
     for b in range(n_batches):
@@ -100,9 +103,9 @@ def _batch_infer(X_all, times_all, first_idx, tft_m, tft_s, bilstm_m, bilstm_s, 
             last_pct = pct
     del tft_sc
 
-    # ── BiLSTM inference ─────────────────────────────────────────────────────
+    # ── BiLSTM inference (1m/15m/30m features only) ───────────────────────────
     print("[Backtest] Running BiLSTM inference...", flush=True)
-    bilstm_sc    = bilstm_s.transform(X_all).astype(np.float32)
+    bilstm_sc    = bilstm_s.transform(X_bi).astype(np.float32)
     bilstm_probs = np.full(n, 0.5, dtype=np.float32)
     last_pct = -1
     for b in range(n_batches):
@@ -437,7 +440,8 @@ def main():
             .reset_index(drop=True)
             .pipe(lambda d: d[d["time"] <= pd.Timestamp.now(tz="UTC")])
             .reset_index(drop=True))
-    df = df.dropna(subset=ACTIVE_FEATURES).reset_index(drop=True)
+    all_needed = BILSTM_FEATURES + TFT_DYN_FEATURES + TFT_STA_FEATURES
+    df = df.dropna(subset=all_needed).reset_index(drop=True)
 
     mask      = df["time"] >= start_dt
     if not mask.any():
@@ -451,10 +455,12 @@ def main():
 
     tft_m, tft_s, bilstm_m, bilstm_s, meta_m, meta_w = _load_models()
 
-    X_all     = df[ACTIVE_FEATURES].values.astype(np.float32)
+    X_tft_dyn = df[TFT_DYN_FEATURES].values.astype(np.float32)
+    X_tft_sta = df[TFT_STA_FEATURES].values.astype(np.float32)
+    X_bi      = df[BILSTM_FEATURES].values.astype(np.float32)
     times_all = df["time"].values
 
-    final_probs = _batch_infer(X_all, times_all, first_idx,
+    final_probs = _batch_infer(X_tft_dyn, X_tft_sta, X_bi, times_all, first_idx,
                                 tft_m, tft_s, bilstm_m, bilstm_s, meta_m, meta_w, df)
 
     print("[Backtest] Simulating trades...", flush=True)

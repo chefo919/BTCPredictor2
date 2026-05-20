@@ -1,17 +1,16 @@
 """
-Attention-Customized Bidirectional LSTM (ACB) for BTC short-term momentum prediction.
+Attention-Customized Bidirectional LSTM (ACB) — short-term momentum model.
 
-Corresponds to the ACB component in:
-  "TFT-ACB-XML: Decision-Level Integration of Customized TFT and Attention-BiLSTM
-   with XGBoost Meta-Learner for BTC Price Forecasting" — Din & Khan (2026), arXiv 2602.12380.
+Inputs:  1m, 15m, 30m features only (30 cols) — high-velocity local signals
+Context: 4 hours of 1-minute candles (SEQ_LEN=240)
+Target:  1-hour price direction (HORIZON=60)
 
-Architecture:
-  Input (30 timesteps × n_features)
-    → Bidirectional LSTM(32) with return_sequences=True
-    → Temporal Attention (Dense(tanh) → Softmax → weighted sum)
-    → Dropout(0.5) → Dense(sigmoid)
+The attention mechanism is price-volume customized:
+  attn_score = LSTM_output_score + |MACD| × vol_ratio
+When volume spikes alongside a strong price move (liquidation cascade),
+this signal is amplified — the ACB flags it and weights that moment heavily.
 
-SEQ_LEN=30 (last 30 minutes) complements TFT's SEQ_LEN=60 (last 60 minutes).
+Reference: arXiv 2602.12380 — TFT-ACB-XML (Din & Khan, 2026)
 """
 import os, sys
 import numpy as np
@@ -28,6 +27,12 @@ MODEL_PATH     = os.path.join(MODEL_DIR, "bilstm.keras")
 SCALER_PATH    = os.path.join(MODEL_DIR, "bilstm_scaler.pkl")
 CHECKPOINT_DIR = os.path.join(MODEL_DIR, "checkpoints_bilstm")
 
+# Feature indices within the 1m/15m/30m feature block (30 features total)
+# 1m features are first 10: rsi(0), macd_diff_pct(1), ema9(2), ema21(3), ema50(4),
+#                            atr_norm(5), bb_pct(6), bb_width(7), obv_zscore(8), vol_ratio(9)
+_MACD_IDX     = 1   # 1m macd_diff_pct — price momentum proxy
+_VOL_IDX      = 9   # 1m vol_ratio    — volume spike indicator
+
 
 def _fmt(seconds: float) -> str:
     h, rem = divmod(int(max(0, seconds)), 3600)
@@ -40,7 +45,6 @@ from tensorflow.keras import layers, regularizers
 
 
 class _SumPool(tf.keras.layers.Layer):
-    """Sum across the time axis — replaces Lambda(reduce_sum) for safe serialization."""
     def call(self, x):
         return tf.reduce_sum(x, axis=1)
 
@@ -48,8 +52,38 @@ class _SumPool(tf.keras.layers.Layer):
         return super().get_config()
 
 
+class _PVAttention(tf.keras.layers.Layer):
+    """
+    Price-Volume customized attention.
+    Weights timesteps by LSTM output relevance AND price×volume interaction,
+    so liquidation cascades (high volume + strong price move) receive higher weight.
+    """
+    def __init__(self, macd_idx: int, vol_idx: int, **kwargs):
+        super().__init__(**kwargs)
+        self.macd_idx = macd_idx
+        self.vol_idx  = vol_idx
+        self.dense    = layers.Dense(1, activation="tanh")
+
+    def call(self, lstm_out, raw_inp):
+        # Standard LSTM-based attention score
+        attn_lstm = self.dense(lstm_out)               # [B, T, 1]
+
+        # Price-volume interaction signal
+        price_signal = tf.abs(raw_inp[..., self.macd_idx:self.macd_idx+1])  # |MACD|
+        vol_signal   = raw_inp[..., self.vol_idx:self.vol_idx+1]             # vol_ratio
+        pv_signal    = price_signal * vol_signal                              # [B, T, 1]
+
+        # Combined: LSTM score amplified by price-volume signal
+        attn_combined = attn_lstm + pv_signal          # [B, T, 1]
+        return tf.nn.softmax(attn_combined, axis=1)    # [B, T, 1]
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"macd_idx": self.macd_idx, "vol_idx": self.vol_idx})
+        return cfg
+
+
 class _CheckpointCB(tf.keras.callbacks.Callback):
-    """Saves model every `every_n` epochs."""
     def __init__(self, checkpoint_dir: str, prefix: str, every_n: int = 5):
         super().__init__()
         self._dir    = checkpoint_dir
@@ -63,7 +97,6 @@ class _CheckpointCB(tf.keras.callbacks.Callback):
 
 
 def _latest_checkpoint() -> tuple:
-    """Return (path, epoch) of the most recent BiLSTM checkpoint, or (None, 0)."""
     if not os.path.exists(CHECKPOINT_DIR):
         return None, 0
     files = [f for f in os.listdir(CHECKPOINT_DIR)
@@ -81,9 +114,11 @@ def _latest_checkpoint() -> tuple:
     return (os.path.join(CHECKPOINT_DIR, best), best_ep) if best else (None, 0)
 
 
-def build_model(n_features: int) -> tf.keras.Model:
-    from tensorflow.keras import models
+def _custom_objects():
+    return {"_SumPool": _SumPool, "_PVAttention": _PVAttention}
 
+
+def build_model(n_features: int) -> tf.keras.Model:
     L2  = 1e-4
     inp = layers.Input(shape=(SEQ_LEN, n_features), name="bilstm_input")
 
@@ -91,12 +126,12 @@ def build_model(n_features: int) -> tf.keras.Model:
         layers.LSTM(32, return_sequences=True,
                     kernel_regularizer=regularizers.l2(L2)),
         name="bi_lstm"
-    )(inp)
+    )(inp)   # [B, T, 64]
 
-    attn_w = layers.Dense(1, activation="tanh", name="attn_score")(x)
-    attn_w = layers.Softmax(axis=1, name="attn_softmax")(attn_w)
+    # Price-volume customized attention
+    attn_w = _PVAttention(_MACD_IDX, _VOL_IDX, name="pv_attn")(x, inp)  # [B, T, 1]
     x      = layers.Multiply(name="attn_apply")([x, attn_w])
-    x      = _SumPool(name="attn_pool")(x)
+    x      = _SumPool(name="attn_pool")(x)   # [B, 64]
 
     x   = layers.Dropout(DROPOUT, name="dropout")(x)
     out = layers.Dense(1, activation="sigmoid",
@@ -128,14 +163,13 @@ def train(feature_df, feature_cols: list) -> dict:
     train_end = int(n * 0.70)
     val_end   = int(n * 0.85)
 
-    # Recency weighting: duplicate the most recent 25% of training data
     recent_start = int(train_end * 0.75)
     X_tr_aug = np.concatenate([X[:train_end], X[recent_start:train_end]])
     y_tr_aug = np.concatenate([y[:train_end], y[recent_start:train_end]])
     perm     = np.random.permutation(len(X_tr_aug))
     X_tr_aug = X_tr_aug[perm]
     y_tr_aug = y_tr_aug[perm]
-    print(f"  Recency augmentation: {train_end:,} → {len(X_tr_aug):,} training rows", flush=True)
+    print(f"  Recency augmentation: {train_end:,} → {len(X_tr_aug):,} rows", flush=True)
 
     scaler  = StandardScaler()
     X_train = scaler.fit_transform(X_tr_aug).astype(np.float32)
@@ -157,17 +191,15 @@ def train(feature_df, feature_cols: list) -> dict:
     val_ds   = make_ds(X_val,   y, train_end, val_end)
     test_ds  = make_ds(X_test,  y, val_end, n)
 
-    # ── Checkpoint resume ─────────────────────────────────────────────────────
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     ckpt_path, start_epoch = _latest_checkpoint()
     n_features = len(feature_cols)
     if ckpt_path:
         try:
-            loaded = tf.keras.models.load_model(ckpt_path, custom_objects={"_SumPool": _SumPool})
+            loaded = tf.keras.models.load_model(ckpt_path, custom_objects=_custom_objects())
             if tuple(loaded.input_shape[1:]) == (SEQ_LEN, n_features):
                 model = loaded
-                print(f"  Resuming BiLSTM from checkpoint epoch {start_epoch}: {ckpt_path}",
-                      flush=True)
+                print(f"  Resuming BiLSTM from checkpoint epoch {start_epoch}", flush=True)
             else:
                 print(f"  Checkpoint shape mismatch — starting fresh.", flush=True)
                 model = build_model(n_features)
@@ -210,8 +242,7 @@ def train(feature_df, feature_cols: list) -> dict:
     callbacks = [
         _ProgressCB(),
         tf.keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True),
-        tf.keras.callbacks.ReduceLROnPlateau(patience=4, factor=0.3, min_lr=1e-6,
-                                              verbose=0),
+        tf.keras.callbacks.ReduceLROnPlateau(patience=4, factor=0.3, min_lr=1e-6, verbose=0),
         _CheckpointCB(CHECKPOINT_DIR, "bilstm", every_n=5),
     ]
 
@@ -219,7 +250,7 @@ def train(feature_df, feature_cols: list) -> dict:
                         epochs=N_EPOCHS, initial_epoch=start_epoch,
                         callbacks=callbacks, verbose=0)
 
-    val_acc = max(history.history.get("val_accuracy", [0.5]))
+    val_acc  = max(history.history.get("val_accuracy", [0.5]))
     _, test_acc = model.evaluate(test_ds, verbose=0)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -231,18 +262,16 @@ def train(feature_df, feature_cols: list) -> dict:
 
 
 def predict_proba(X_seq: np.ndarray, feature_cols: list = None) -> float:
-    """X_seq: (n_rows, n_features) — uses last SEQ_LEN rows."""
-    model  = tf.keras.models.load_model(MODEL_PATH, custom_objects={"_SumPool": _SumPool})
+    model  = tf.keras.models.load_model(MODEL_PATH, custom_objects=_custom_objects())
     scaler = joblib.load(SCALER_PATH)
     Xs  = scaler.transform(X_seq).astype(np.float32)
     inp = Xs[-SEQ_LEN:].reshape(1, SEQ_LEN, -1)
     return float(model.predict(inp, verbose=0)[0][0])
 
 
-def predict_proba_batch(X_all: np.ndarray, feature_cols: list,
+def predict_proba_batch(X_all: np.ndarray, feature_cols: list = None,
                          batch_size: int = 512) -> np.ndarray:
-    """Batch inference — returns probability for each row (SEQ_LEN lookback)."""
-    model  = tf.keras.models.load_model(MODEL_PATH, custom_objects={"_SumPool": _SumPool})
+    model  = tf.keras.models.load_model(MODEL_PATH, custom_objects=_custom_objects())
     scaler = joblib.load(SCALER_PATH)
 
     X_sc  = scaler.transform(X_all).astype(np.float32)

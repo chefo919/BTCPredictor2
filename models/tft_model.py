@@ -1,8 +1,14 @@
 """
 Adaptive Temporal Fusion Transformer — macro direction model (TFT-ACB-XML).
 
-Predicts 4-hour price direction using 24 hours of 1-min candle context.
-VSN learns per-timestep feature weights so irrelevant features are suppressed.
+Predicts 1-hour price direction using 24 hours of 1-min candle context.
+Features are split into two groups:
+  - Dynamic (time-varying): h1/h4/d1 indicators — fed through VSN + LSTM + Attention
+  - Static (slow-moving):   w1/mo1 indicators   — barely change in 24h; fed as context
+
+The static covariates are concatenated as the last feature block and processed
+via a separate GRN at the final timestep, then added to the pooled dynamic output.
+This prevents attention dilution and cleanly isolates genuine macro regime signals.
 
 Reference: arXiv 2602.12380 — TFT-ACB-XML (Din & Khan, 2026)
 """
@@ -16,10 +22,11 @@ from config import (SEQ_LEN_TFT as SEQ_LEN, HORIZON_TFT as HORIZON,
                     N_EPOCHS_TFT as N_EPOCHS, BATCH_TFT as BATCH,
                     STRIDE_TFT as STRIDE, D_MODEL, N_HEADS, DROPOUT_TFT as DROPOUT)
 
-MODEL_DIR      = os.path.join(ROOT, "models", "saved")
-MODEL_PATH     = os.path.join(MODEL_DIR, "tft.keras")
-SCALER_PATH    = os.path.join(MODEL_DIR, "tft_scaler.pkl")
-CHECKPOINT_DIR = os.path.join(MODEL_DIR, "checkpoints_tft")
+MODEL_DIR        = os.path.join(ROOT, "models", "saved")
+MODEL_PATH       = os.path.join(MODEL_DIR, "tft.keras")
+SCALER_PATH      = os.path.join(MODEL_DIR, "tft_scaler.pkl")
+CHECKPOINT_DIR   = os.path.join(MODEL_DIR, "checkpoints_tft")
+N_STATIC_PATH    = os.path.join(MODEL_DIR, "tft_n_static.txt")
 
 
 import tensorflow as tf
@@ -64,8 +71,7 @@ class VSN(tf.keras.layers.Layer):
 
     def call(self, x, training=False):
         weights = self.softmax(self.context_grn(x, training=training))
-        # Accumulate weighted sum one feature at a time.
-        # Avoids materializing [batch, seq, n_features, d_model] — 87x less VRAM.
+        # Accumulate weighted sum one feature at a time — avoids [B,T,n_feat,D] stack.
         out = self.feature_grns[0](x[..., 0:1], training=training) * weights[..., 0:1]
         for i in range(1, self.n_features):
             out = out + self.feature_grns[i](x[..., i:i+1], training=training) * weights[..., i:i+1]
@@ -79,13 +85,43 @@ class VSN(tf.keras.layers.Layer):
         return cfg
 
 
-def build_model(n_features: int) -> tf.keras.Model:
+class _StaticGRN(tf.keras.layers.Layer):
+    """Applies a GRN to the last timestep of static features, returning [B, D_MODEL]."""
+    def __init__(self, n_static, d_model, dropout=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.n_static = n_static
+        self.d_model  = d_model
+        self.grn      = GRN(d_model, dropout, name="static_grn")
+
+    def call(self, x, training=False):
+        # x: [B, T, n_static] — take last timestep (values are ~constant over 24h)
+        static_last = x[:, -1, :]           # [B, n_static]
+        return self.grn(static_last, training=training)   # [B, D_MODEL]
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"n_static": self.n_static, "d_model": self.d_model,
+                    "dropout": self.grn.drop.rate})
+        return cfg
+
+
+def build_model(n_dynamic: int, n_static: int) -> tf.keras.Model:
+    """
+    Single-input model: input shape = (SEQ_LEN, n_dynamic + n_static).
+    Internally splits into dynamic (VSN path) and static (last-timestep GRN).
+    """
     from tensorflow.keras import models
 
-    inp = layers.Input(shape=(SEQ_LEN, n_features), name="seq_input")
+    n_total = n_dynamic + n_static
+    inp = layers.Input(shape=(SEQ_LEN, n_total), name="seq_input")
 
-    vsn          = VSN(n_features, D_MODEL, DROPOUT, name="vsn")
-    x, _weights  = vsn(inp)
+    # Split dynamic / static portions
+    dyn_inp    = inp[..., :n_dynamic]   # [B, T, n_dynamic] — h1/h4/d1
+    static_inp = inp[..., n_dynamic:]   # [B, T, n_static]  — w1/mo1
+
+    # ── Dynamic path: VSN → LSTM → Attention → FFN ───────────────────────────
+    vsn         = VSN(n_dynamic, D_MODEL, DROPOUT, name="vsn")
+    x, _weights = vsn(dyn_inp)
 
     lstm_out = layers.LSTM(D_MODEL, return_sequences=True,
                             kernel_regularizer=regularizers.l2(1e-4),
@@ -104,10 +140,17 @@ def build_model(n_features: int) -> tf.keras.Model:
     ffn = layers.Dense(D_MODEL, name="ffn2")(ffn)
     x   = layers.LayerNormalization(name="ln_ffn")(ffn + x)
 
-    pooled = layers.GlobalAveragePooling1D(name="pool")(x)
-    out    = layers.Dense(1, activation="sigmoid",
-                           kernel_regularizer=regularizers.l2(1e-3),
-                           name="output")(pooled)
+    pooled = layers.GlobalAveragePooling1D(name="pool")(x)   # [B, D_MODEL]
+
+    # ── Static covariate path: GRN on last timestep ───────────────────────────
+    static_ctx = _StaticGRN(n_static, D_MODEL, DROPOUT, name="static_ctx")(static_inp)
+
+    # Combine: static context adds macro regime signal to pooled dynamic output
+    combined = layers.Add(name="combine")([pooled, static_ctx])
+
+    out = layers.Dense(1, activation="sigmoid",
+                        kernel_regularizer=regularizers.l2(1e-3),
+                        name="output")(combined)
 
     model = models.Model(inp, out, name="adaptive_tft")
     model.compile(
@@ -127,7 +170,6 @@ def _fmt(seconds: float) -> str:
 
 
 class _CheckpointCB(tf.keras.callbacks.Callback):
-    """Saves model every `every_n` epochs."""
     def __init__(self, checkpoint_dir: str, prefix: str, every_n: int = 5):
         super().__init__()
         self._dir    = checkpoint_dir
@@ -141,7 +183,6 @@ class _CheckpointCB(tf.keras.callbacks.Callback):
 
 
 def _latest_checkpoint() -> tuple:
-    """Return (path, epoch) of the most recent TFT checkpoint, or (None, 0)."""
     if not os.path.exists(CHECKPOINT_DIR):
         return None, 0
     files = [f for f in os.listdir(CHECKPOINT_DIR)
@@ -159,34 +200,40 @@ def _latest_checkpoint() -> tuple:
     return (os.path.join(CHECKPOINT_DIR, best), best_ep) if best else (None, 0)
 
 
-def train(feature_df, feature_cols: list) -> dict:
+def _custom_objects():
+    return {"GRN": GRN, "VSN": VSN, "_StaticGRN": _StaticGRN}
+
+
+def train(feature_df, dynamic_cols: list, static_cols: list) -> dict:
     import time
     from sklearn.preprocessing import StandardScaler
 
     t0 = time.time()
 
-    df = feature_df.dropna(subset=feature_cols).copy()
+    all_cols = dynamic_cols + static_cols
+    df = feature_df.dropna(subset=all_cols).copy()
     df["target"] = (df["close"].shift(-HORIZON) > df["close"]).astype(int)
     df = df.dropna(subset=["target"])
-    print(f"  TFT training rows: {len(df):,}  label balance: {df['target'].mean():.3f}",
-          flush=True)
+    print(f"  TFT training rows: {len(df):,}  label balance: {df['target'].mean():.3f}  "
+          f"dynamic={len(dynamic_cols)} static={len(static_cols)}", flush=True)
 
-    X = df[feature_cols].values
+    X = df[all_cols].values   # [n, n_dynamic + n_static]
     y = df["target"].values
     n = len(X)
+    n_dynamic = len(dynamic_cols)
+    n_static  = len(static_cols)
 
     train_end = int(n * 0.70)
     val_end   = int(n * 0.85)
 
-    # Recency weighting: duplicate the most recent 25% of training data so
-    # recent market patterns count twice during training
+    # Recency augmentation
     recent_start = int(train_end * 0.75)
     X_tr_aug = np.concatenate([X[:train_end], X[recent_start:train_end]])
     y_tr_aug = np.concatenate([y[:train_end], y[recent_start:train_end]])
     perm     = np.random.permutation(len(X_tr_aug))
     X_tr_aug = X_tr_aug[perm]
     y_tr_aug = y_tr_aug[perm]
-    print(f"  Recency augmentation: {train_end:,} → {len(X_tr_aug):,} training rows", flush=True)
+    print(f"  Recency augmentation: {train_end:,} → {len(X_tr_aug):,} rows", flush=True)
 
     scaler  = StandardScaler()
     X_train = scaler.fit_transform(X_tr_aug).astype(np.float32)
@@ -212,26 +259,23 @@ def train(feature_df, feature_cols: list) -> dict:
     # ── Checkpoint resume ─────────────────────────────────────────────────────
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     ckpt_path, start_epoch = _latest_checkpoint()
-    n_features = len(feature_cols)
+    expected_shape = (SEQ_LEN, n_dynamic + n_static)
     if ckpt_path:
         try:
-            loaded = tf.keras.models.load_model(
-                ckpt_path, custom_objects={"GRN": GRN, "VSN": VSN}
-            )
-            if tuple(loaded.input_shape[1:]) == (SEQ_LEN, n_features):
+            loaded = tf.keras.models.load_model(ckpt_path, custom_objects=_custom_objects())
+            if tuple(loaded.input_shape[1:]) == expected_shape:
                 model = loaded
-                print(f"  Resuming TFT from checkpoint epoch {start_epoch}: {ckpt_path}",
-                      flush=True)
+                print(f"  Resuming TFT from checkpoint epoch {start_epoch}", flush=True)
             else:
                 print(f"  Checkpoint shape mismatch — starting fresh.", flush=True)
-                model = build_model(n_features)
+                model = build_model(n_dynamic, n_static)
                 start_epoch = 0
         except Exception as e:
             print(f"  Checkpoint load failed ({e}) — starting fresh.", flush=True)
-            model = build_model(n_features)
+            model = build_model(n_dynamic, n_static)
             start_epoch = 0
     else:
-        model = build_model(n_features)
+        model = build_model(n_dynamic, n_static)
         start_epoch = 0
 
     print(f"  Parameters: {model.count_params():,}", flush=True)
@@ -264,8 +308,7 @@ def train(feature_df, feature_cols: list) -> dict:
     callbacks = [
         _ProgressCB(),
         tf.keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True),
-        tf.keras.callbacks.ReduceLROnPlateau(patience=4, factor=0.3, min_lr=1e-6,
-                                              verbose=0),
+        tf.keras.callbacks.ReduceLROnPlateau(patience=4, factor=0.3, min_lr=1e-6, verbose=0),
         _CheckpointCB(CHECKPOINT_DIR, "tft", every_n=5),
     ]
 
@@ -273,12 +316,15 @@ def train(feature_df, feature_cols: list) -> dict:
                         epochs=N_EPOCHS, initial_epoch=start_epoch,
                         callbacks=callbacks, verbose=0)
 
-    val_acc = max(history.history.get("val_accuracy", [0.5]))
+    val_acc  = max(history.history.get("val_accuracy", [0.5]))
     _, test_acc = model.evaluate(test_ds, verbose=0)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     model.save(MODEL_PATH)
     joblib.dump(scaler, SCALER_PATH)
+    # Save n_static so inference knows the split
+    with open(N_STATIC_PATH, "w") as f:
+        f.write(str(n_static))
 
     return {"test_acc": float(test_acc), "val_acc": float(val_acc),
             "time_taken": time.time() - t0}
@@ -286,12 +332,20 @@ def train(feature_df, feature_cols: list) -> dict:
 
 # ── Inference ─────────────────────────────────────────────────────────────────
 
-def predict_proba_batch(X_all: np.ndarray, feature_cols: list,
+def _load_n_static() -> int:
+    if os.path.exists(N_STATIC_PATH):
+        with open(N_STATIC_PATH) as f:
+            return int(f.read().strip())
+    return 27   # default: w1 (13) + mo1 (14)
+
+
+def predict_proba_batch(X_dynamic: np.ndarray, X_static: np.ndarray,
                          batch_size: int = 512) -> np.ndarray:
-    """Batch inference — returns probability for each row (SEQ_LEN lookback)."""
-    model  = tf.keras.models.load_model(MODEL_PATH, custom_objects={"GRN": GRN, "VSN": VSN})
+    """Batch inference. X_dynamic: (n, n_dyn), X_static: (n, n_static)."""
+    model  = tf.keras.models.load_model(MODEL_PATH, custom_objects=_custom_objects())
     scaler = joblib.load(SCALER_PATH)
 
+    X_all = np.concatenate([X_dynamic, X_static], axis=1)
     X_sc  = scaler.transform(X_all).astype(np.float32)
     n     = len(X_sc)
     probs = np.full(n, 0.5, dtype=np.float32)
@@ -309,13 +363,12 @@ def predict_proba_batch(X_all: np.ndarray, feature_cols: list,
     return probs
 
 
-def predict_proba(X_seq: np.ndarray, feature_cols: list = None) -> float:
-    """X_seq: (n_rows, n_features) — uses last SEQ_LEN rows."""
-    model  = tf.keras.models.load_model(
-        MODEL_PATH, custom_objects={"GRN": GRN, "VSN": VSN}
-    )
+def predict_proba(X_dynamic: np.ndarray, X_static: np.ndarray) -> float:
+    """Single-sample inference. Uses last SEQ_LEN rows of combined input."""
+    model  = tf.keras.models.load_model(MODEL_PATH, custom_objects=_custom_objects())
     scaler = joblib.load(SCALER_PATH)
-    Xs     = scaler.transform(X_seq).astype(np.float32)
+    X_all  = np.concatenate([X_dynamic, X_static], axis=1)
+    Xs     = scaler.transform(X_all).astype(np.float32)
     inp    = Xs[-SEQ_LEN:].reshape(1, SEQ_LEN, -1)
     return float(model.predict(inp, verbose=0)[0][0])
 

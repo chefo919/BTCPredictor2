@@ -17,21 +17,20 @@ logging.getLogger("tensorflow").setLevel(logging.ERROR)
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from data_manager import update_data
-from features.engineer import FEATURE_COLS, update_features
+from features.engineer import FEATURE_COLS, get_feature_groups, update_features
 from models import tft_model, bilstm_model, meta_model
+from config import BUY_THRESHOLD, SELL_THRESHOLD
 
 ROOT        = os.path.dirname(os.path.dirname(__file__))
 MERGED_PATH = os.path.join(ROOT, "data", "btc_merged_features.csv")
 
-# Use feature-selected subset if available
-_sel_path = os.path.join(ROOT, "models", "saved", "selected_features.json")
-if os.path.exists(_sel_path):
-    import json as _json
-    ACTIVE_FEATURES = _json.load(open(_sel_path))["selected"]
-else:
-    ACTIVE_FEATURES = FEATURE_COLS
+_groups          = get_feature_groups()
+BILSTM_FEATURES  = _groups["bilstm"]
+TFT_DYN_FEATURES = _groups["tft_dynamic"]
+TFT_STA_FEATURES = _groups["tft_static"]
+ALL_FEATURES     = BILSTM_FEATURES + TFT_DYN_FEATURES + TFT_STA_FEATURES
 
-from config import BUY_THRESHOLD, SELL_THRESHOLD
+# Load tail needs enough rows for the TFT (largest window)
 SEQ_LEN = tft_model.SEQ_LEN
 
 
@@ -55,10 +54,9 @@ def _load_tail(path: str, n: int = 200) -> pd.DataFrame:
 def _market_context(row: pd.Series) -> list:
     items = []
     for tf, rsi_col, macd_col in [
-        ("1m",  "rsi",            "macd_diff_pct"),
-        ("1H",  "h1_rsi",         "h1_macd_diff_pct"),
-        ("4H",  "h4_rsi",         "h4_macd_diff_pct"),
-        ("1D",  "d1_rsi",         "d1_macd_diff_pct"),
+        ("1H",  "h1_rsi",  "h1_macd_diff_pct"),
+        ("4H",  "h4_rsi",  "h4_macd_diff_pct"),
+        ("1D",  "d1_rsi",  "d1_macd_diff_pct"),
     ]:
         if rsi_col not in row.index:
             continue
@@ -69,23 +67,6 @@ def _market_context(row: pd.Series) -> list:
     return items
 
 
-def _key_drivers(row: pd.Series) -> list:
-    candidates = []
-    for tf, col in [("1m", "rsi"), ("1H", "h1_rsi"), ("4H", "h4_rsi"), ("1D", "d1_rsi")]:
-        if col not in row.index:
-            continue
-        val = float(row[col]) * 100
-        if val < 30:
-            label, strength = "oversold",   (30 - val) / 30
-        elif val > 70:
-            label, strength = "overbought", (val - 70) / 30
-        else:
-            label, strength = "neutral", 0.0
-        candidates.append((strength, tf, "RSI", f"{val:.1f}", label))
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[:3]
-
-
 def generate_signal(fetch: bool = True) -> dict:
     if fetch:
         print("Fetching latest data...", flush=True)
@@ -93,10 +74,10 @@ def generate_signal(fetch: bool = True) -> dict:
         update_features()
 
     if not os.path.exists(MERGED_PATH):
-        raise RuntimeError("btc_merged_features.csv not found. Run features/engineer.py first.")
+        raise RuntimeError("btc_merged_features.csv not found.")
 
     df = _load_tail(MERGED_PATH, n=SEQ_LEN + 10)
-    df = df.dropna(subset=FEATURE_COLS)
+    df = df.dropna(subset=ALL_FEATURES)
 
     if len(df) < SEQ_LEN:
         raise RuntimeError(f"Not enough clean rows: {len(df)} < {SEQ_LEN}")
@@ -107,13 +88,18 @@ def generate_signal(fetch: bool = True) -> dict:
     current_price = float(last_row["close"]) if "close" in df.columns else float("nan")
     lag_minutes   = (now - last_candle).total_seconds() / 60
 
-    X_seq    = df[ACTIVE_FEATURES].values
-    p_tft    = tft_model.predict_proba(X_seq, ACTIVE_FEATURES)
-    p_bilstm = bilstm_model.predict_proba(X_seq, ACTIVE_FEATURES)
+    X_dyn    = df[TFT_DYN_FEATURES].values
+    X_sta    = df[TFT_STA_FEATURES].values
+    X_bi     = df[BILSTM_FEATURES].values
+
+    p_tft    = tft_model.predict_proba(X_dyn, X_sta)
+    p_bilstm = bilstm_model.predict_proba(X_bi)
+
     if meta_model.is_trained():
-        final_score = meta_model.predict_proba(p_tft, p_bilstm, df.iloc[-1], ACTIVE_FEATURES)
+        final_score = meta_model.predict_proba(p_tft, p_bilstm, last_row,
+                                                TFT_DYN_FEATURES + TFT_STA_FEATURES)
     else:
-        final_score = (p_tft + p_bilstm) / 2.0   # fallback before meta is trained
+        final_score = (p_tft + p_bilstm) / 2.0
 
     if final_score > BUY_THRESHOLD:
         signal = "BUY"
@@ -136,39 +122,7 @@ def generate_signal(fetch: bool = True) -> dict:
         "signal":      signal,
         "confidence":  conf,
         "context":     _market_context(last_row),
-        "drivers":     _key_drivers(last_row),
     }
-
-
-def print_signal(s: dict):
-    SEP        = "=" * 42
-    signal_str = s["signal_time"].strftime("%Y-%m-%d %H:%M UTC")
-    candle_str = s["last_candle"].strftime("%Y-%m-%d %H:%M UTC")
-    lag        = s["lag_minutes"]
-
-    print(SEP)
-    print("BTC Live Signal — Adaptive TFT")
-    print(SEP)
-    print(f"Signal time:  {signal_str}")
-    print(f"Last candle:  {candle_str}")
-    if lag <= 2:
-        print(f"Data lag:     {lag:.0f} min OK")
-    else:
-        print(f"Data lag:     {lag:.0f} min  WARNING: data is behind")
-    print(f"BTC Price:    ${s['price']:,.0f}")
-
-    context = s.get("context", [])
-    if context:
-        print()
-        print("Market Context:")
-        for tf, rsi, trend, note in context:
-            print(f"[{tf:<3}]  RSI: {rsi:5.1f}  Trend: {trend}{note}")
-
-    print()
-    print(f"TFT Score:    {s['tft_prob']:.3f}")
-    print(f"Signal:       {s['signal']}")
-    print(f"Confidence:   {s['confidence']}")
-    print(SEP)
 
 
 if __name__ == "__main__":
@@ -176,4 +130,5 @@ if __name__ == "__main__":
         print("Models not trained. Run: python training/train.py --force")
         sys.exit(1)
     s = generate_signal()
-    print_signal(s)
+    print(f"Signal: {s['signal']} ({s['confidence']})  score={s['final_score']:.3f}  "
+          f"TFT={s['tft_prob']:.3f}  BiLSTM={s['bilstm_prob']:.3f}")

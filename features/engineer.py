@@ -48,6 +48,20 @@ FEATURE_COLS = (FEATURE_1M + FEATURE_15M + FEATURE_30M
 # Total: 10+10+10+10+10+10+13+14 = 87 features
 
 
+def get_feature_groups() -> dict:
+    """
+    Returns the feature split for the specialized TFT-ACB-XML architecture.
+
+    TFT (macro):   h1/h4/d1 time-varying (30 cols) + w1/mo1 static covariates (27 cols)
+    BiLSTM (ACB):  1m/15m/30m short-term momentum only (30 cols)
+    """
+    return {
+        "bilstm":      FEATURE_1M + FEATURE_15M + FEATURE_30M,   # 30 — micro momentum
+        "tft_dynamic": FEATURE_1H + FEATURE_4H + FEATURE_1D,      # 30 — time-varying macro
+        "tft_static":  FEATURE_1W + FEATURE_1MO,                  # 27 — slow-moving covariates
+    }
+
+
 # ── Loaders ───────────────────────────────────────────────────────────────────
 
 def _load(path: str) -> Optional[pd.DataFrame]:

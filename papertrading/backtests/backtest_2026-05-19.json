@@ -1,0 +1,40 @@
+{
+  "period": {
+    "start": "2026-04-15",
+    "end": "2026-05-19"
+  },
+  "starting_capital": 1000.0,
+  "final_value": 1000.0,
+  "metrics": {
+    "total_pnl": 0.0,
+    "total_pnl_pct": 0.0,
+    "bah_pct": 3.36,
+    "max_drawdown": 0.0,
+    "sharpe_ratio": 0.0,
+    "total_trades": 0,
+    "winning_trades": 0,
+    "losing_trades": 0,
+    "avg_hold_min": 0.0,
+    "avg_pnl": 0.0,
+    "best_trade": 0.0,
+    "worst_trade": 0.0
+  },
+  "signals": {
+    "buy": 0,
+    "sell": 0,
+    "hold": 49738
+  },
+  "chop_filtered": 0,
+  "model_accuracy": {
+    "cnn_lstm": 0.0,
+    "xgboost": 0.0,
+    "transformer": 0.0
+  },
+  "ensemble_weights": {
+    "cnn_lstm": 0.33962157689101874,
+    "xgboost": 0.33656396134912897,
+    "transformer": 0.3238144617598523
+  },
+  "monthly_breakdown": {},
+  "trades": []
+}

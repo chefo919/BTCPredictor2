@@ -1,0 +1,35 @@
+# ── Data (all CSVs are large — never commit) ─────────────────────────────────
+data/
+
+# ── Trained model weights (binary, too large for git) ────────────────────────
+models/saved/*.keras
+models/saved/*.pkl
+models/saved/checkpoints_tft/
+models/saved/checkpoints_bilstm/
+
+# ── Training state (regenerated on each run) ──────────────────────────────────
+models/saved/last_train_rows.txt
+models/saved/training_cutoff.txt
+models/saved/model_accuracies.json
+
+# ── Keep these in git (small JSON config files) ───────────────────────────────
+!models/saved/selected_features.json
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# ── Environment ───────────────────────────────────────────────────────────────
+.env
+*.env
+venv/
+.venv/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Sessions (paper trading history — local only) ────────────────────────────
+papertrading/sessions/

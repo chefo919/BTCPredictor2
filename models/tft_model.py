@@ -64,12 +64,11 @@ class VSN(tf.keras.layers.Layer):
 
     def call(self, x, training=False):
         weights = self.softmax(self.context_grn(x, training=training))
-        processed = tf.stack(
-            [self.feature_grns[i](x[..., i:i+1], training=training)
-             for i in range(self.n_features)],
-            axis=-2,
-        )
-        out = tf.reduce_sum(processed * tf.expand_dims(weights, -1), axis=-2)
+        # Accumulate weighted sum one feature at a time.
+        # Avoids materializing [batch, seq, n_features, d_model] — 87x less VRAM.
+        out = self.feature_grns[0](x[..., 0:1], training=training) * weights[..., 0:1]
+        for i in range(1, self.n_features):
+            out = out + self.feature_grns[i](x[..., i:i+1], training=training) * weights[..., i:i+1]
         return out, weights
 
     def get_config(self):

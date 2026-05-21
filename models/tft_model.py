@@ -105,21 +105,19 @@ class _StaticGRN(tf.keras.layers.Layer):
         return cfg
 
 
-def build_model(n_dynamic: int, n_static: int) -> tf.keras.Model:
+def build_model(n_dynamic: int, n_static: int = 0) -> tf.keras.Model:
     """
     Single-input model: input shape = (SEQ_LEN, n_dynamic + n_static).
-    Internally splits into dynamic (VSN path) and static (last-timestep GRN).
+    When n_static=0 (no static covariates), skips the static GRN path entirely.
     """
     from tensorflow.keras import models
 
     n_total = n_dynamic + n_static
     inp = layers.Input(shape=(SEQ_LEN, n_total), name="seq_input")
 
-    # Split dynamic / static portions
-    dyn_inp    = inp[..., :n_dynamic]   # [B, T, n_dynamic] — h1/h4/d1
-    static_inp = inp[..., n_dynamic:]   # [B, T, n_static]  — w1/mo1
+    dyn_inp = inp[..., :n_dynamic]   # [B, T, n_dynamic]
 
-    # ── Dynamic path: VSN → LSTM → Attention → FFN ───────────────────────────
+    # ── Dynamic path: VSN -> LSTM -> Attention -> FFN ─────────────────────────
     vsn         = VSN(n_dynamic, D_MODEL, DROPOUT, name="vsn")
     x, _weights = vsn(dyn_inp)
 
@@ -142,11 +140,13 @@ def build_model(n_dynamic: int, n_static: int) -> tf.keras.Model:
 
     pooled = layers.GlobalAveragePooling1D(name="pool")(x)   # [B, D_MODEL]
 
-    # ── Static covariate path: GRN on last timestep ───────────────────────────
-    static_ctx = _StaticGRN(n_static, D_MODEL, DROPOUT, name="static_ctx")(static_inp)
-
-    # Combine: static context adds macro regime signal to pooled dynamic output
-    combined = layers.Add(name="combine")([pooled, static_ctx])
+    # ── Static covariate path (skipped when n_static=0) ──────────────────────
+    if n_static > 0:
+        static_inp = inp[..., n_dynamic:]
+        static_ctx = _StaticGRN(n_static, D_MODEL, DROPOUT, name="static_ctx")(static_inp)
+        combined   = layers.Add(name="combine")([pooled, static_ctx])
+    else:
+        combined = pooled
 
     out = layers.Dense(1, activation="sigmoid",
                         kernel_regularizer=regularizers.l2(1e-3),
@@ -280,7 +280,7 @@ def train(feature_df, dynamic_cols: list, static_cols: list) -> dict:
 
     print(f"  Parameters: {model.count_params():,}", flush=True)
 
-    BAR = 30
+    BAR = 36
 
     class _ProgressCB(tf.keras.callbacks.Callback):
         def __init__(self):
@@ -336,7 +336,7 @@ def _load_n_static() -> int:
     if os.path.exists(N_STATIC_PATH):
         with open(N_STATIC_PATH) as f:
             return int(f.read().strip())
-    return 27   # default: w1 (13) + mo1 (14)
+    return 0    # default: no static covariates
 
 
 def predict_proba_batch(X_dynamic: np.ndarray, X_static: np.ndarray,

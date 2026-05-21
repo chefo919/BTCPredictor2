@@ -214,7 +214,7 @@ def train(feature_df, feature_cols: list) -> dict:
 
     print(f"  BiLSTM parameters: {model.count_params():,}", flush=True)
 
-    BAR = 30
+    BAR = 36
 
     class _ProgressCB(tf.keras.callbacks.Callback):
         def __init__(self):

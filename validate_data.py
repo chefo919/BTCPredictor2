@@ -1,17 +1,12 @@
 """
-Data validation script — cross-references all raw and feature CSVs against btc_1m.csv.
+Data validation script — validates btc_1m.csv, feature CSVs, and yearly merged files.
 
 Checks:
-  1. Row counts, date ranges
-  2. Duplicate timestamps
-  3. Gap detection (unexpected missing candles)
-  4. OHLCV sanity (high >= low, volume >= 0, prices in range)
-  5. OHLCV aggregation: spot-sample higher-TF candles against 1m data
-  6. Feature CSV timestamp alignment with raw CSVs
-  7. Feature value ranges (RSI in [0,1], ATR >= 0, etc.)
-  8. Merged CSV: NaN analysis per column
-  9. RSI window bug check: mo1_rsi must differ from d1_rsi
- 10. Lag check: h1 features at time T must use pre-T hourly data (not future)
+  1. 1m: row count, gaps, duplicates, OHLCV sanity
+  2. Feature CSVs: row counts, feature counts, value ranges
+  3. Yearly merged CSVs: presence and row counts
+  4. Merged CSV: NaN analysis, feature count, RSI window check
+  5. Rolling check: h1_rsi must CHANGE within each hour (proves rolling pipeline)
 """
 import os
 import sys
@@ -208,30 +203,17 @@ def check_merged(merged: pd.DataFrame):
             _p(FAIL, f"RSI window bug: mo1_rsi == d1_rsi in {pct:.1f}% of rows — "
                      f"RSI window bug may still be present")
 
-    # Lag check: h1 feature at time T must use data from BEFORE T
-    # The h1_rsi at time T should equal the h1_features rsi
-    # at the previous completed hour boundary (i.e., floor(T/1H))
-    # We verify: merged h1_rsi doesn't change within the same 1H block
-    # (all 1m rows in [14:00, 14:59] should have the same h1_rsi value)
+    # Rolling check: h1_rsi must CHANGE within each hour (proves rolling, not stale cardinal)
     if "h1_rsi" in merged.columns:
-        sample_hour = merged.dropna(subset=["h1_rsi"]).head(3000).copy()
-        sample_hour["hour_block"] = sample_hour["time"].dt.floor("h")
-        consistency = sample_hour.groupby("hour_block")["h1_rsi"].nunique()
-        inconsistent = (consistency > 1).sum()
-        if inconsistent == 0:
-            _p(PASS, "Lag check: h1_rsi is constant within each 1H block (no leakage)")
+        sample_h1 = merged.dropna(subset=["h1_rsi"]).tail(3000).copy()
+        sample_h1["hour_block"] = sample_h1["time"].dt.floor("h")
+        unique_per_block = sample_h1.groupby("hour_block")["h1_rsi"].nunique()
+        varying_pct = (unique_per_block > 1).mean() * 100
+        if varying_pct > 50:
+            _p(PASS, f"Rolling check: h1_rsi varies within hours ({varying_pct:.0f}% of blocks)")
         else:
-            _p(FAIL, f"Lag check: h1_rsi changes within {inconsistent} 1H block(s) — possible leakage")
-
-    if "h4_rsi" in merged.columns:
-        sample_h4 = merged.dropna(subset=["h4_rsi"]).head(3000).copy()
-        sample_h4["h4_block"] = sample_h4["time"].dt.floor("4h")
-        consistency_h4 = sample_h4.groupby("h4_block")["h4_rsi"].nunique()
-        incon_h4 = (consistency_h4 > 1).sum()
-        if incon_h4 == 0:
-            _p(PASS, "Lag check: h4_rsi is constant within each 4H block (no leakage)")
-        else:
-            _p(FAIL, f"Lag check: h4_rsi changes within {incon_h4} 4H block(s) — possible leakage")
+            _p(FAIL, f"Rolling check: h1_rsi constant within {100-varying_pct:.0f}% of hours — "
+                     f"may be stale cardinal value, not rolling")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -248,68 +230,26 @@ def main():
     _p(INFO, f"btc_1m.csv: {len(m1):,} rows  |  {m1['time'].min()} → {m1['time'].max()}")
     m1_times = set(m1["time"])
 
-    # ── 2. Raw CSV checks ────────────────────────────────────────────────────
-    raw_configs = [
-        ("btc_15m.csv",  15,   "15m"),
-        ("btc_30m.csv",  30,   "30m"),
-        ("btc_1h.csv",   60,   "1H"),
-        ("btc_4h.csv",   240,  "4H"),
-        ("btc_1d.csv",   1440, "1D"),
-        ("btc_1w.csv",   10080,"1W"),
-        ("btc_1mo.csv",  None, "1MO"),
-    ]
-
+    # ── 2. 1m sanity ─────────────────────────────────────────────────────────
     print()
     print(SEP2)
-    print("RAW CSV CHECKS")
+    print("1M CSV CHECKS")
     print(SEP2)
 
-    # 1m checks first
     check_duplicates(m1, "1m")
     check_gaps(m1, 1, "1m", tolerance=5)
     check_ohlcv_sanity(m1, "1m")
 
-    raw_dfs = {}
-    for fname, freq_min, label in raw_configs:
-        path = os.path.join(DATA_DIR, fname)
-        if not os.path.exists(path):
-            _p(WARN, f"{fname}: file not found — skipping")
-            continue
-
-        print()
-        df = load_raw(fname)
-        raw_dfs[label] = df
-        _p(INFO, f"{fname}: {len(df):,} rows  |  {df['time'].min()} → {df['time'].max()}")
-
-        check_duplicates(df, label)
-        if freq_min:
-            check_gaps(df, freq_min, label, tolerance=3)
-        check_ohlcv_sanity(df, label)
-
-        # Close alignment with 1m: every higher-TF close timestamp must exist in 1m
-        htf_times = set(df["time"])
-        not_in_m1 = htf_times - m1_times
-        if not_in_m1:
-            _p(WARN, f"{label}: {len(not_in_m1)} timestamps not found in 1m data "
-                     f"(expected if 1m data starts later)")
-        else:
-            _p(PASS, f"{label}: all candle timestamps exist in 1m data")
-
-        # OHLCV aggregation spot-check (skip 1W / 1MO — too sparse for reliable check)
-        if freq_min and freq_min <= 1440:
-            agg_spot_check(m1, df, freq_min, label, n_samples=200)
-
     # ── 3. Feature CSV checks ────────────────────────────────────────────────
     feat_configs = [
-        ("btc_1m_features.csv",  "btc_1m.csv",  "1m features"),
-        ("btc_15m_features.csv", "btc_15m.csv", "15m features"),
-        ("btc_30m_features.csv", "btc_30m.csv", "30m features"),
-        ("btc_1h_features.csv",  "btc_1h.csv",  "1H features"),
-        ("btc_4h_features.csv",  "btc_4h.csv",  "4H features"),
-        ("btc_1d_features.csv",  "btc_1d.csv",  "1D features"),
-        # 1W/1MO features are rolling windows computed on daily data → compare against 1d
-        ("btc_1w_features.csv",  "btc_1d.csv",  "1W features"),
-        ("btc_1mo_features.csv", "btc_1d.csv",  "1MO features"),
+        ("btc_1m_features.csv",  "1m features",   12),
+        ("btc_15m_features.csv", "15m features",  12),
+        ("btc_30m_features.csv", "30m features",  12),
+        ("btc_1h_features.csv",  "1H features",   12),
+        ("btc_4h_features.csv",  "4H features",   12),
+        ("btc_1d_features.csv",  "1D features",   12),
+        ("btc_1w_features.csv",  "1W features",   12),
+        ("btc_1mo_features.csv", "1MO features",  12),
     ]
 
     print()
@@ -317,24 +257,21 @@ def main():
     print("FEATURE CSV CHECKS")
     print(SEP2)
 
-    for feat_fname, raw_fname, label in feat_configs:
+    for feat_fname, label, expected_features in feat_configs:
         feat_path = os.path.join(DATA_DIR, feat_fname)
-        raw_path  = os.path.join(DATA_DIR, raw_fname)
         if not os.path.exists(feat_path):
             _p(WARN, f"{feat_fname}: not found — skipping")
             continue
-        if not os.path.exists(raw_path):
-            _p(WARN, f"{raw_fname}: raw file not found — skipping {label} alignment check")
-            raw_df = None
-        else:
-            raw_df = load_raw(raw_fname)
 
         print()
         feat_df = load_feat(feat_fname)
-        _p(INFO, f"{feat_fname}: {len(feat_df):,} rows × {len(feat_df.columns)} cols")
+        n_feat  = sum(1 for c in feat_df.columns if c not in ("time", "close"))
+        _p(INFO, f"{feat_fname}: {len(feat_df):,} rows × {n_feat} features")
 
-        if raw_df is not None:
-            check_feat_timestamps(feat_df, raw_df, label)
+        if n_feat != expected_features:
+            _p(FAIL, f"{label}: expected {expected_features} features, got {n_feat}")
+        else:
+            _p(PASS, f"{label}: feature count OK ({n_feat})")
 
         check_feat_ranges(feat_df, label)
 
@@ -343,25 +280,45 @@ def main():
         if not all_nan.empty:
             _p(FAIL, f"{label}: entirely-NaN columns: {list(all_nan.index)}")
 
-        # Summarize NaN warm-up rows (first N rows with any NaN)
-        first_valid = feat_df.dropna().index[0] if feat_df.dropna().shape[0] > 0 else None
-        if first_valid:
-            _p(INFO, f"{label}: first fully-valid row at index {first_valid} "
-                     f"({feat_df.loc[first_valid, 'time']})")
+    # ── 4. Yearly merged files ───────────────────────────────────────────────
+    yearly_dir = os.path.join(DATA_DIR, "yearly")
+    print()
+    print(SEP2)
+    print("YEARLY MERGED FILES (data/yearly/)")
+    print(SEP2)
 
-    # ── 4. Merged CSV checks ─────────────────────────────────────────────────
-    merged_path = os.path.join(DATA_DIR, "btc_merged_features.csv")
-    if os.path.exists(merged_path):
-        print()
-        print("Loading merged CSV (this may take 30s)...")
-        merged = pd.read_csv(merged_path, parse_dates=["time"])
-        if merged["time"].dt.tz is None:
-            merged["time"] = pd.to_datetime(merged["time"], utc=True)
+    if os.path.exists(yearly_dir):
+        yearly_files = sorted(f for f in os.listdir(yearly_dir) if f.endswith("_merged.csv"))
+        if yearly_files:
+            for fname in yearly_files:
+                path = os.path.join(yearly_dir, fname)
+                df_y = pd.read_csv(path, parse_dates=["time"], nrows=1)
+                rc   = sum(1 for _ in open(path)) - 1
+                _p(INFO, f"{fname}: {rc:,} rows")
+            _p(PASS, f"Found {len(yearly_files)} yearly file(s)")
+        else:
+            _p(WARN, "yearly/ directory exists but no YYYY_merged.csv files found")
+    else:
+        _p(WARN, "data/yearly/ directory not found — run features/engineer.py first")
+
+    # ── 5. Merged checks via yearly files ────────────────────────────────────
+    print()
+    print("Loading yearly files for merged checks...")
+    dfs = []
+    if os.path.exists(yearly_dir):
+        for fname in sorted(os.listdir(yearly_dir)):
+            if fname.endswith("_merged.csv"):
+                df_y = pd.read_csv(os.path.join(yearly_dir, fname), parse_dates=["time"])
+                if df_y["time"].dt.tz is None:
+                    df_y["time"] = pd.to_datetime(df_y["time"], utc=True)
+                dfs.append(df_y)
+    if dfs:
+        merged = pd.concat(dfs, ignore_index=True).sort_values("time").reset_index(drop=True)
         check_merged(merged)
     else:
-        _p(WARN, "btc_merged_features.csv not found")
+        _p(WARN, "No yearly merged files found — run features/engineer.py first")
 
-    # ── 5. Summary ───────────────────────────────────────────────────────────
+    # ── 6. Summary ───────────────────────────────────────────────────────────
     print()
     print(SEP)
     print("Validation complete.")

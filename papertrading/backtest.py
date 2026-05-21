@@ -31,7 +31,7 @@ TFT_STA_FEATURES = _groups["tft_static"]
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 ROOT          = os.path.dirname(os.path.dirname(__file__))
-MERGED_PATH   = os.path.join(ROOT, "data", "btc_merged_features.csv")
+YEARLY_DIR    = os.path.join(ROOT, "data", "yearly")
 MODELS_DIR    = os.path.join(ROOT, "models", "saved")
 BACKTESTS_DIR = os.path.join(os.path.dirname(__file__), "backtests")
 
@@ -431,12 +431,24 @@ def main():
     end_dt   = pd.Timestamp.now(tz="UTC")
 
     print(f"[Backtest] {start_dt.date()} -> {end_dt.date()}", flush=True)
-    print("[Backtest] Loading btc_merged_features.csv...", flush=True)
+    print("[Backtest] Loading yearly feature files...", flush=True)
 
-    df = pd.read_csv(MERGED_PATH, parse_dates=["time"])
-    if df["time"].dt.tz is None:
-        df["time"] = pd.to_datetime(df["time"], utc=True)
-    df = (df.sort_values("time")
+    dfs = []
+    for fname in sorted(os.listdir(YEARLY_DIR)):
+        if not fname.endswith("_merged.csv"):
+            continue
+        year = int(fname.split("_")[0])
+        if year < start_dt.year - 1:   # keep one extra year before start for seq warm-up
+            continue
+        df_y = pd.read_csv(os.path.join(YEARLY_DIR, fname), parse_dates=["time"])
+        if df_y["time"].dt.tz is None:
+            df_y["time"] = pd.to_datetime(df_y["time"], utc=True)
+        dfs.append(df_y)
+    if not dfs:
+        print(f"ERROR: No yearly files found in {YEARLY_DIR}")
+        sys.exit(1)
+    df = (pd.concat(dfs, ignore_index=True)
+            .sort_values("time")
             .reset_index(drop=True)
             .pipe(lambda d: d[d["time"] <= pd.Timestamp.now(tz="UTC")])
             .reset_index(drop=True))

@@ -21,8 +21,8 @@ from features.engineer import FEATURE_COLS, get_feature_groups, update_features
 from models import tft_model, bilstm_model, meta_model
 from config import BUY_THRESHOLD, SELL_THRESHOLD
 
-ROOT        = os.path.dirname(os.path.dirname(__file__))
-MERGED_PATH = os.path.join(ROOT, "data", "btc_merged_features.csv")
+ROOT       = os.path.dirname(os.path.dirname(__file__))
+YEARLY_DIR = os.path.join(ROOT, "data", "yearly")
 
 _groups          = get_feature_groups()
 BILSTM_FEATURES  = _groups["bilstm"]
@@ -51,6 +51,28 @@ def _load_tail(path: str, n: int = 200) -> pd.DataFrame:
     return df
 
 
+def _load_yearly_tail(n: int) -> pd.DataFrame:
+    """Load the last n rows from yearly files (current + previous year for seq warm-up)."""
+    if not os.path.exists(YEARLY_DIR):
+        raise RuntimeError("data/yearly/ not found. Run features/engineer.py first.")
+    now_year = pd.Timestamp.now(tz="UTC").year
+    dfs = []
+    for y in [now_year - 1, now_year]:
+        path = os.path.join(YEARLY_DIR, f"{y}_merged.csv")
+        if os.path.exists(path):
+            dfs.append(_load_tail(path, n=n))
+    if not dfs:
+        raise RuntimeError("No yearly merged files found for current or previous year.")
+    df = (pd.concat(dfs)
+            .sort_values("time")
+            .drop_duplicates("time")
+            .tail(n)
+            .reset_index(drop=True))
+    if df["time"].dt.tz is None:
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+    return df
+
+
 def _market_context(row: pd.Series) -> list:
     items = []
     for tf, rsi_col, macd_col in [
@@ -73,10 +95,7 @@ def generate_signal(fetch: bool = True) -> dict:
         update_data()
         update_features()
 
-    if not os.path.exists(MERGED_PATH):
-        raise RuntimeError("btc_merged_features.csv not found.")
-
-    df = _load_tail(MERGED_PATH, n=SEQ_LEN + 10)
+    df = _load_yearly_tail(n=SEQ_LEN + 10)
     df = df.dropna(subset=ALL_FEATURES)
 
     if len(df) < SEQ_LEN:

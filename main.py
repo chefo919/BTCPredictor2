@@ -28,7 +28,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from data_manager import update_csv_from_coinbase, get_live_price, update_fear_greed
+from data_manager import update_csv_from_coinbase, get_live_price
 from prediction.predict import generate_signal
 from models import tft_model, bilstm_model, meta_model
 from features.engineer import FEATURE_COLS
@@ -49,7 +49,7 @@ PORT              = 8080
 PRICE_HISTORY_MAX = 240
 TEMPLATES_DIR     = os.path.join(ROOT, "templates")
 MODELS_DIR        = os.path.join(ROOT, "models", "saved")
-MERGED_PATH       = os.path.join(ROOT, "data", "btc_merged_features.csv")
+YEARLY_DIR        = os.path.join(ROOT, "data", "yearly")
 from config import BUY_THRESHOLD, SELL_THRESHOLD, SEQ_LEN_TFT
 SEQ_LSTM = SEQ_LEN_TFT   # warmup window = TFT lookback (the larger of the two)
 
@@ -168,11 +168,25 @@ def _run_backtest(start_date_str: str):
         start_dt = pd.Timestamp(start_date_str, tz="UTC")
         print(f"[Backtest] Starting from {start_date_str}...", flush=True)
 
-        # Load and filter data
-        df = pd.read_csv(MERGED_PATH, parse_dates=["time"])
-        if df["time"].dt.tz is None:
-            df["time"] = pd.to_datetime(df["time"], utc=True)
-        df = (df.sort_values("time")
+        # Load from yearly files (include one year before start for seq warm-up)
+        dfs = []
+        for fname in sorted(os.listdir(YEARLY_DIR)):
+            if not fname.endswith("_merged.csv"):
+                continue
+            year = int(fname.split("_")[0])
+            if year < start_dt.year - 1:
+                continue
+            df_y = pd.read_csv(os.path.join(YEARLY_DIR, fname), parse_dates=["time"])
+            if df_y["time"].dt.tz is None:
+                df_y["time"] = pd.to_datetime(df_y["time"], utc=True)
+            dfs.append(df_y)
+        if not dfs:
+            bt_state.error   = "No yearly feature files found. Run features/engineer.py."
+            bt_state.phase   = "error"
+            bt_state.running = False
+            return
+        df = (pd.concat(dfs, ignore_index=True)
+                .sort_values("time")
                 .reset_index(drop=True)
                 .pipe(lambda d: d[d["time"] <= pd.Timestamp.now(tz="UTC")])
                 .reset_index(drop=True))
@@ -413,10 +427,6 @@ def _execute_trade(trader: PaperTrader, price: float, sig: dict) -> str | None:
 # ── Real-time trading cycle ────────────────────────────────────────────────────
 
 def _run_cycle():
-    try:
-        update_fear_greed()   # no-op unless date changed; keeps sentiment model current
-    except Exception:
-        pass
     try:
         csv_result = update_csv_from_coinbase()
     except Exception as e:

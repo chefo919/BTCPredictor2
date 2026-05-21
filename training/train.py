@@ -22,11 +22,12 @@ except RuntimeError:
 from features.engineer import FEATURE_COLS, get_feature_groups
 from models import tft_model, bilstm_model, meta_model
 
-ROOT        = os.path.dirname(os.path.dirname(__file__))
-MERGED_PATH = os.path.join(ROOT, "data", "btc_merged_features.csv")
-STAMP_PATH  = os.path.join(ROOT, "models", "saved", "last_train_rows.txt")
+ROOT       = os.path.dirname(os.path.dirname(__file__))
+YEARLY_DIR = os.path.join(ROOT, "data", "yearly")
+STAMP_PATH = os.path.join(ROOT, "models", "saved", "last_train_rows.txt")
 
 from config import TRAINING_CUTOFF_DATE
+TRAINING_START = "2022-02-01"  # skip first 30d — rolling window warm-up period
 
 
 def _fmt(seconds: float) -> str:
@@ -54,12 +55,27 @@ def should_retrain(current_rows: int, threshold: int = 1000) -> bool:
 
 
 def load_and_engineer() -> pd.DataFrame:
-    if not os.path.exists(MERGED_PATH):
-        print("btc_merged_features.csv not found. Run features/engineer.py first.", flush=True)
+    if not os.path.exists(YEARLY_DIR):
+        print("data/yearly/ not found. Run features/engineer.py first.", flush=True)
         sys.exit(1)
-    print(f"Loading {MERGED_PATH}...", flush=True)
-    df = pd.read_csv(MERGED_PATH, parse_dates=["time"])
-    print(f"Loaded {len(df):,} rows with {len(FEATURE_COLS)} features.", flush=True)
+    start_ts  = pd.Timestamp(TRAINING_START, tz="UTC")
+    cutoff_ts = pd.Timestamp(TRAINING_CUTOFF_DATE, tz="UTC")
+    dfs = []
+    for fname in sorted(os.listdir(YEARLY_DIR)):
+        if not fname.endswith("_merged.csv"):
+            continue
+        df_y = pd.read_csv(os.path.join(YEARLY_DIR, fname), parse_dates=["time"])
+        if df_y["time"].dt.tz is None:
+            df_y["time"] = pd.to_datetime(df_y["time"], utc=True)
+        df_y = df_y[(df_y["time"] >= start_ts) & (df_y["time"] <= cutoff_ts)]
+        if not df_y.empty:
+            dfs.append(df_y)
+    if not dfs:
+        print(f"No data between {TRAINING_START} and {TRAINING_CUTOFF_DATE}. Check data/yearly/.", flush=True)
+        sys.exit(1)
+    df = pd.concat(dfs, ignore_index=True).sort_values("time").reset_index(drop=True)
+    print(f"Loaded {len(df):,} rows from {len(dfs)} yearly files "
+          f"({TRAINING_START} -> {TRAINING_CUTOFF_DATE}, {len(FEATURE_COLS)} features).", flush=True)
     return df
 
 
@@ -82,12 +98,7 @@ def _ram_available() -> str:
 
 
 def run_training(force: bool = False, test_mode: bool = False):
-    df = load_and_engineer()
-
-    cutoff_ts = pd.Timestamp(TRAINING_CUTOFF_DATE, tz="UTC")
-    before    = len(df)
-    df        = df[df["time"] <= cutoff_ts].copy()
-    print(f"[Training] Cutoff {TRAINING_CUTOFF_DATE}: {before:,} → {len(df):,} rows", flush=True)
+    df           = load_and_engineer()   # already filtered to [TRAINING_START, TRAINING_CUTOFF_DATE]
     current_rows = len(df)
 
     if not force:
@@ -211,7 +222,7 @@ def run_training(force: bool = False, test_mode: bool = False):
     print(f"[Training] Meta accuracy:   {meta_results['train_acc']:.3f}")
     w = meta_results.get("weights", {})
     print(f"[Training] Error-reciprocal weights — TFT: {w.get('tft',0):.3f}  BiLSTM: {w.get('bilstm',0):.3f}")
-    print(f"[Training] Data cutoff: {cutoff_ts}")
+    print(f"[Training] Data window: {TRAINING_START} -> {TRAINING_CUTOFF_DATE}")
     print(f"Models saved to:  models/saved/")
     print(f"Total time:       {_fmt(total_elapsed)}")
     print(SEP)
@@ -225,8 +236,6 @@ if __name__ == "__main__":
     if config_only:
         import json as _json
         df        = load_and_engineer()
-        cutoff_ts = pd.Timestamp(TRAINING_CUTOFF_DATE, tz="UTC")
-        df        = df[df["time"] <= cutoff_ts]
         _sel_path = os.path.join(ROOT, "models", "saved", "selected_features.json")
         active    = (_json.load(open(_sel_path))["selected"]
                      if os.path.exists(_sel_path) else FEATURE_COLS)

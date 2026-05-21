@@ -11,15 +11,7 @@ ROOT       = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR   = os.path.join(ROOT, "data")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 
-PATH_1M          = os.path.join(DATA_DIR, "btc_1m.csv")
-FEAR_GREED_PATH  = os.path.join(DATA_DIR, "btc_fear_greed.csv")
-PATH_15M  = os.path.join(DATA_DIR, "btc_15m.csv")
-PATH_30M  = os.path.join(DATA_DIR, "btc_30m.csv")
-PATH_1H   = os.path.join(DATA_DIR, "btc_1h.csv")
-PATH_4H   = os.path.join(DATA_DIR, "btc_4h.csv")
-PATH_1D   = os.path.join(DATA_DIR, "btc_1d.csv")
-PATH_1W   = os.path.join(DATA_DIR, "btc_1w.csv")
-PATH_1MO  = os.path.join(DATA_DIR, "btc_1mo.csv")
+PATH_1M = os.path.join(DATA_DIR, "btc_1m.csv")
 
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 GAPS_LOG      = os.path.join(DATA_DIR, "gaps.log")
@@ -173,9 +165,58 @@ def _save_deduped(df: pd.DataFrame, path: str) -> pd.DataFrame:
     return df
 
 
+def _validate_ohlcv(df: pd.DataFrame, source: str = "") -> bool:
+    """
+    Validates OHLCV data before any write to btc_1m.csv.
+    Returns True if data is clean, False if any violation found.
+    Logs what failed so corruption can be traced.
+    """
+    if df.empty:
+        return True
+    errors = []
+    if (df["high"] < df["low"]).any():
+        errors.append(f"high < low in {(df['high'] < df['low']).sum()} rows")
+    if (df["high"] < df["open"]).any():
+        errors.append(f"high < open in {(df['high'] < df['open']).sum()} rows")
+    if (df["high"] < df["close"]).any():
+        errors.append(f"high < close in {(df['high'] < df['close']).sum()} rows")
+    if (df["low"] > df["open"]).any():
+        errors.append(f"low > open in {(df['low'] > df['open']).sum()} rows")
+    if (df["low"] > df["close"]).any():
+        errors.append(f"low > close in {(df['low'] > df['close']).sum()} rows")
+    if (df["volume"] < 0).any():
+        errors.append(f"negative volume in {(df['volume'] < 0).sum()} rows")
+    bad_price = ((df["close"] < 1000) | (df["close"] > 500_000)).sum()
+    if bad_price:
+        errors.append(f"price out of range [1k-500k] in {bad_price} rows")
+    if errors:
+        tag = f" [{source}]" if source else ""
+        for e in errors:
+            print(f"[1m VALIDATION FAIL{tag}] {e}", flush=True)
+        return False
+    return True
+
+
+def get_last_1m_update() -> dict:
+    """Returns manifest info about the last btc_1m.csv write. Safe to call anytime."""
+    manifest = _load_manifest()
+    info = manifest.get("btc_1m", {})
+    return {
+        "last_candle":  info.get("last_candle",  "unknown"),
+        "first_candle": info.get("first_candle", "unknown"),
+        "rows":         info.get("rows",          0),
+        "verified_at":  info.get("verified_at",   "never"),
+    }
+
+
 def _append_to_1m(new_rows: pd.DataFrame) -> int:
     """Fast append to btc_1m.csv without rewriting the full file."""
     if new_rows.empty:
+        return 0
+
+    # Validate before any write — never let corrupt data reach the CSV
+    if not _validate_ohlcv(new_rows, source="append"):
+        print("[1m] Append aborted — validation failed. No data written.", flush=True)
         return 0
 
     if os.path.exists(PATH_1M):
@@ -215,149 +256,25 @@ def _append_to_1m(new_rows: pd.DataFrame) -> int:
     return n
 
 
-# ── Higher TF resampling ──────────────────────────────────────────────────────
-
-def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    d = df.set_index("time").sort_index()
-    r = d.resample(rule, closed="left", label="left").agg(
-        open=("open", "first"), high=("high", "max"),
-        low=("low", "min"),   close=("close", "last"), volume=("volume", "sum"),
-    ).dropna()
-    r = r[r["volume"] > 0]
-    return r.reset_index()
-
-
-def _resample_from_daily(df_1d: pd.DataFrame, rule: str) -> pd.DataFrame:
-    d = df_1d.set_index("time").sort_index()
-    kwargs = {} if rule == "MS" else {"closed": "left", "label": "left"}
-    r = d.resample(rule, **kwargs).agg(
-        open=("open", "first"), high=("high", "max"),
-        low=("low", "min"),   close=("close", "last"), volume=("volume", "sum"),
-    ).dropna()
-    r = r[r["volume"] > 0]
-    return r.reset_index()
-
-
-def _week_start(ts: pd.Timestamp) -> pd.Timestamp:
-    return ts.floor("D") - pd.Timedelta(days=ts.weekday())
-
-
-def _month_start(ts: pd.Timestamp) -> pd.Timestamp:
-    return pd.Timestamp(ts.year, ts.month, 1, tz=ts.tz)
-
-
-def _build_higher_tfs(df_1m: pd.DataFrame):
-    for label, rule, path in [
-        ("15M", "15min", PATH_15M),
-        ("30M", "30min", PATH_30M),
-        ("1H",  "1h",    PATH_1H),
-        ("4H",  "4h",    PATH_4H),
-        ("1D",  "D",     PATH_1D),
-    ]:
-        if os.path.exists(path):
-            continue
-        print(f"  Building {label} from {len(df_1m):,} 1m candles...", flush=True)
-        tf_df = _resample_ohlcv(df_1m, rule)
-        tf_df.to_csv(path, index=False)
-        print(f"  {label}: {len(tf_df):,} candles saved", flush=True)
-
-
-def _append_higher_tfs(full_1m: pd.DataFrame) -> dict:
-    counts = {"15M": 0, "30M": 0, "1H": 0, "4H": 0, "1D": 0}
-    now = full_1m["time"].max()
-    for label, rule, path, floor_fn in [
-        ("15M", "15min", PATH_15M, lambda t: t.floor("15min")),
-        ("30M", "30min", PATH_30M, lambda t: t.floor("30min")),
-        ("1H",  "1h",    PATH_1H,  lambda t: t.floor("1h")),
-        ("4H",  "4h",    PATH_4H,  lambda t: t.floor("4h")),
-        ("1D",  "D",     PATH_1D,  lambda t: t.normalize()),
-    ]:
-        if not os.path.exists(path):
-            continue
-        cutoff   = floor_fn(now)
-        complete = full_1m[full_1m["time"] < cutoff]
-        if complete.empty:
-            continue
-        new_tf   = _resample_ohlcv(complete, rule)
-        existing = _load_csv(path)
-        if existing is not None and not existing.empty:
-            new_tf = new_tf[new_tf["time"] > existing["time"].max()]
-        if new_tf.empty:
-            continue
-        new_tf.to_csv(path, mode="a", header=False, index=False)
-        counts[label] = len(new_tf)
-    return counts
-
-
-def _build_weekly_monthly(df_1d: pd.DataFrame):
-    for label, rule, path in [("1W", "W-MON", PATH_1W), ("1MO", "MS", PATH_1MO)]:
-        if os.path.exists(path):
-            continue
-        print(f"  Building {label} from {len(df_1d):,} daily candles...", flush=True)
-        tf_df = _resample_from_daily(df_1d, rule)
-        tf_df.to_csv(path, index=False)
-        print(f"  {label}: {len(tf_df):,} candles saved", flush=True)
-
-
-def _append_weekly_monthly(df_1d: pd.DataFrame) -> dict:
-    counts   = {"1W": 0, "1MO": 0}
-    now      = df_1d["time"].max()
-    wk_start = _week_start(now)
-    mo_start = _month_start(now)
-    for label, rule, path, cutoff in [
-        ("1W",  "W-MON", PATH_1W,  wk_start),
-        ("1MO", "MS",    PATH_1MO, mo_start),
-    ]:
-        if not os.path.exists(path):
-            continue
-        complete = df_1d[df_1d["time"] < cutoff]
-        if complete.empty:
-            continue
-        new_tf   = _resample_from_daily(complete, rule)
-        existing = _load_csv(path)
-        if existing is not None and not existing.empty:
-            new_tf = new_tf[new_tf["time"] > existing["time"].max()]
-        if new_tf.empty:
-            continue
-        new_tf.to_csv(path, mode="a", header=False, index=False)
-        counts[label] = len(new_tf)
-    return counts
-
-
 # ── Feature update integration ────────────────────────────────────────────────
 
-def _run_features(total_fetched: int, tf_counts: dict, wm_counts: dict):
+def _run_features(total_fetched: int):
     import sys as _sys
     _sys.path.insert(0, ROOT)
     from features.engineer import update_features as _update_features
 
-    feat_stats = _update_features()
+    feat_stats   = _update_features()
+    merged_added = feat_stats.get("merged_added", 0)
 
-    merged_added   = feat_stats.get("merged_added", 0)
-    partial_recalc = feat_stats.get("partial_recalculated", False)
-
-    print(f"[Data]     +{total_fetched:,} new 1m candles", flush=True)
-    for label, count in [("15M", tf_counts.get("15M", 0)),
-                         ("30M", tf_counts.get("30M", 0)),
-                         ("1H",  tf_counts.get("1H",  0)),
-                         ("4H",  tf_counts.get("4H",  0)),
-                         ("1D",  tf_counts.get("1D",  0)),
-                         ("1W",  wm_counts.get("1W",  0)),
-                         ("1MO", wm_counts.get("1MO", 0))]:
-        if count > 0:
-            print(f"[Data]     +{count} new {label} candles", flush=True)
-        else:
-            print(f"[Data]     no new {label} period", flush=True)
-
-    if total_fetched == 0 and partial_recalc:
-        print("[Features] Partial week/month recalculated", flush=True)
-    elif merged_added > 0:
-        print(f"[Features] +{merged_added:,} new feature rows added to merged", flush=True)
+    if total_fetched > 0:
+        print(f"[Data]     +{total_fetched:,} new 1m candles", flush=True)
+    if merged_added > 0:
+        print(f"[Features] +{merged_added:,} new feature rows added", flush=True)
 
     merged_path = os.path.join(DATA_DIR, "btc_merged_features.csv")
     if os.path.exists(merged_path):
         n_merged = sum(1 for _ in open(merged_path)) - 1
-        print(f"[Ready]    btc_merged_features.csv up to date -- {n_merged:,} rows", flush=True)
+        print(f"[Ready]    btc_merged_features.csv up to date — {n_merged:,} rows", flush=True)
 
 
 # ── Flow 1 — CSV update (Coinbase ONLY) ──────────────────────────────────────
@@ -375,14 +292,19 @@ def update_csv_from_coinbase() -> dict:
     existing = _load_csv(PATH_1M)
     now_ts   = int(datetime.now(tz=timezone.utc).timestamp())
 
+    # Last CLOSED candle boundary: floor to minute, subtract one candle.
+    # A candle opening at T:00 closes at T:59 — it is complete only at T+1:00.
+    # This guarantees we never write a partial open candle.
+    end_ts = (now_ts // GRANULARITY) * GRANULARITY - GRANULARITY
+
     if existing is not None and not existing.empty:
         last_ts     = int(existing["time"].max().timestamp())
         fetch_start = last_ts + GRANULARITY
     else:
         fetch_start = int(datetime(2022, 1, 1, tzinfo=timezone.utc).timestamp())
 
-    gap_seconds = now_ts - fetch_start
-    if gap_seconds <= GRANULARITY:
+    gap_seconds = end_ts - fetch_start
+    if gap_seconds <= 0:
         return {"ok": True, "new_candles": 0, "minutes_behind": 0.0,
                 "message": "[CSV] Already up to date"}
 
@@ -394,8 +316,8 @@ def update_csv_from_coinbase() -> dict:
     cursor     = fetch_start
     batch_num  = 0
 
-    while cursor < now_ts:
-        batch_end = min(cursor + BATCH_SIZE * GRANULARITY, now_ts)
+    while cursor < end_ts:
+        batch_end = min(cursor + BATCH_SIZE * GRANULARITY, end_ts)
 
         if show_progress:
             print(f"[Data] Behind by {minutes_behind:.0f} minutes — "
@@ -405,8 +327,8 @@ def update_csv_from_coinbase() -> dict:
         if rows is not None and not rows.empty:
             buffer_dfs.append(rows)
         else:
-            _log_gap(cursor, now_ts, "Coinbase unavailable")
-            remaining = (now_ts - cursor) / 60
+            _log_gap(cursor, end_ts, "Coinbase unavailable")
+            remaining = (end_ts - cursor) / 60
             msg = "[CSV] Coinbase unavailable — CSV unchanged, gap logged"
             print(msg, flush=True)
             return {"ok": False, "new_candles": 0, "minutes_behind": remaining, "message": msg}
@@ -423,28 +345,103 @@ def update_csv_from_coinbase() -> dict:
     all_new    = pd.concat(buffer_dfs, ignore_index=True)
     n_appended = _append_to_1m(all_new)
 
-    # Update higher TFs (append mode — no full rewrite)
-    full_1m = _load_csv(PATH_1M)
-    if full_1m is not None:
-        _build_higher_tfs(full_1m)
-        _append_higher_tfs(full_1m)
-        current_1d = _load_csv(PATH_1D)
-        if current_1d is not None and not current_1d.empty:
-            _build_weekly_monthly(current_1d)
-            _append_weekly_monthly(current_1d)
+    # Update rolling features (incremental if yearly files exist, full rebuild otherwise)
+    _run_features(n_appended)
 
-    # Recalculate features for new rows
-    import sys as _sys
-    _sys.path.insert(0, ROOT)
-    from features.engineer import update_features as _uf
-    _uf()
-
-    new_last_ts = int(full_1m["time"].max().timestamp()) if full_1m is not None else now_ts
-    remaining   = max(0.0, (now_ts - new_last_ts - GRANULARITY) / 60)
+    full_1m     = _load_csv(PATH_1M)
+    new_last_ts = int(full_1m["time"].max().timestamp()) if full_1m is not None else end_ts
+    remaining   = max(0.0, (end_ts - new_last_ts) / 60)
 
     msg = f"[CSV] +{n_appended} new candles from Coinbase — all CSVs up to date"
     print(msg, flush=True)
     return {"ok": True, "new_candles": n_appended, "minutes_behind": remaining, "message": msg}
+
+
+# ── Full rewrite — fetches everything from scratch ───────────────────────────
+
+def rewrite_1m_csv(start_date: str = "2022-01-01") -> int:
+    """
+    Deletes btc_1m.csv and fetches all historical 1m candles from Coinbase
+    from start_date to now. Validates every batch before writing.
+
+    Safeguards:
+      - Backs up existing file before deleting
+      - Validates OHLCV on every batch — skips corrupt batches, logs gaps
+      - Updates manifest after every 500 batches (checkpoint)
+      - Never writes partial candles (stops at now - 2 minutes)
+
+    Returns total candles written.
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    start_ts  = int(pd.Timestamp(start_date, tz="UTC").timestamp())
+    # Last closed candle boundary — same logic as update_csv_from_coinbase
+    now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+    end_ts = (now_ts // GRANULARITY) * GRANULARITY - GRANULARITY
+
+    total_batches = max(1, (end_ts - start_ts) // (BATCH_SIZE * GRANULARITY) + 1)
+    print(f"[Rewrite] Start:  {pd.Timestamp(start_ts, unit='s', tz='UTC')}", flush=True)
+    print(f"[Rewrite] End:    {pd.Timestamp(end_ts,   unit='s', tz='UTC')}", flush=True)
+    print(f"[Rewrite] ~{total_batches:,} batches of {BATCH_SIZE} candles each", flush=True)
+    print(f"[Rewrite] Estimated time: {total_batches * REQUEST_DELAY / 60:.0f}–{total_batches * (REQUEST_DELAY + 0.1) / 60:.0f} minutes", flush=True)
+
+    # Backup existing file
+    if os.path.exists(PATH_1M):
+        backup = _backup_1m()
+        print(f"[Rewrite] Backup: {backup}", flush=True)
+        os.remove(PATH_1M)
+        print(f"[Rewrite] Deleted old btc_1m.csv", flush=True)
+
+    # Write CSV header
+    pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"]).to_csv(
+        PATH_1M, index=False)
+
+    cursor      = start_ts
+    total       = 0
+    batch_num   = 0
+    skipped     = 0
+
+    while cursor < end_ts:
+        batch_end = min(cursor + BATCH_SIZE * GRANULARITY, end_ts)
+        rows      = fetch_coinbase_only(cursor, batch_end, max_retries=2)
+
+        if rows is not None and not rows.empty:
+            if _validate_ohlcv(rows, source=f"batch@{pd.Timestamp(cursor, unit='s', tz='UTC').date()}"):
+                rows.to_csv(PATH_1M, mode="a", header=False, index=False)
+                total += len(rows)
+            else:
+                _log_gap(cursor, batch_end, "validation_failed")
+                skipped += 1
+        else:
+            _log_gap(cursor, batch_end, "api_returned_empty")
+
+        cursor    = batch_end + GRANULARITY
+        batch_num += 1
+        _time.sleep(REQUEST_DELAY)
+
+        # Progress every 500 batches + checkpoint manifest
+        if batch_num % 500 == 0:
+            pct = (cursor - start_ts) / (end_ts - start_ts) * 100
+            print(f"[Rewrite] {pct:.1f}%  {total:,} candles written  "
+                  f"({skipped} batches skipped)", flush=True)
+            # Checkpoint: update manifest so progress survives a crash
+            df_ck = _load_csv(PATH_1M)
+            if df_ck is not None and not df_ck.empty:
+                _save_manifest(len(df_ck),
+                               str(df_ck["time"].min()),
+                               str(df_ck["time"].max()))
+
+    # Final manifest update
+    df_final = _load_csv(PATH_1M)
+    if df_final is not None and not df_final.empty:
+        _save_manifest(len(df_final),
+                       str(df_final["time"].min()),
+                       str(df_final["time"].max()))
+
+    print(f"[Rewrite] COMPLETE — {total:,} candles written, {skipped} batches skipped", flush=True)
+    if skipped:
+        print(f"[Rewrite] Check {GAPS_LOG} for details on skipped batches", flush=True)
+    return total
 
 
 # ── Flow 2 — Live price (NEVER writes to any file) ───────────────────────────
@@ -560,11 +557,7 @@ def update_data() -> int:
     fetch_end = int(datetime.now(tz=timezone.utc).timestamp())
 
     if fetch_start >= fetch_end:
-        _build_higher_tfs(existing_1m)
-        current_1d = _load_csv(PATH_1D)
-        if current_1d is not None:
-            _build_weekly_monthly(current_1d)
-        _run_features(0, {"15M": 0, "30M": 0, "1H": 0, "4H": 0, "1D": 0}, {"1W": 0, "1MO": 0})
+        _run_features(0)
         return 0
 
     total_seconds = fetch_end - fetch_start
@@ -606,79 +599,9 @@ def update_data() -> int:
         combined   = pd.concat([current_df, new_df]) if (current_df is not None and not current_df.empty) else new_df
         current_df = _save_deduped(combined, PATH_1M)
 
-    _build_higher_tfs(current_df)
-    tf_counts = _append_higher_tfs(current_df)
-
-    current_1d = _load_csv(PATH_1D)
-    if current_1d is not None and not current_1d.empty:
-        _build_weekly_monthly(current_1d)
-        wm_counts = _append_weekly_monthly(current_1d)
-    else:
-        wm_counts = {"1W": 0, "1MO": 0}
-
-    _run_features(total_fetched, tf_counts, wm_counts)  # tf_counts already includes 15M/30M
+    _run_features(total_fetched)
     return total_fetched
 
-
-# ── Fear & Greed Index ────────────────────────────────────────────────────────
-
-def fetch_fear_greed_history() -> "pd.DataFrame":
-    """Fetch full F&G history from alternative.me (free, no auth). Saves to CSV."""
-    import pandas as _pd
-    url  = "https://api.alternative.me/fng/?limit=2000&format=json"
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    data = resp.json().get("data", [])
-    if not data:
-        raise RuntimeError("[FearGreed] Empty response from alternative.me")
-    df = _pd.DataFrame(data)[["timestamp", "value", "value_classification"]]
-    df["date"]  = _pd.to_datetime(df["timestamp"].astype(int), unit="s", utc=True).dt.date
-    df["value"] = df["value"].astype(int)
-    df = (df[["date", "value", "value_classification"]]
-            .sort_values("date")
-            .drop_duplicates("date")
-            .reset_index(drop=True))
-    os.makedirs(DATA_DIR, exist_ok=True)
-    df.to_csv(FEAR_GREED_PATH, index=False)
-    print(f"[FearGreed] {len(df)} days of Fear & Greed history saved", flush=True)
-    return df
-
-
-def update_fear_greed() -> bool:
-    """
-    Fetch today's F&G value and append to CSV if not already present.
-    Returns True if a new row was added, False if already up to date.
-    Safe to call every cycle — only hits the API once per day.
-    """
-    import pandas as _pd
-    from datetime import date as _date
-    today = _date.today()
-
-    if os.path.exists(FEAR_GREED_PATH):
-        existing = _pd.read_csv(FEAR_GREED_PATH)
-        existing["date"] = _pd.to_datetime(existing["date"]).dt.date
-        if today in existing["date"].values:
-            return False  # already have today
-
-    try:
-        url  = "https://api.alternative.me/fng/?limit=1&format=json"
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json().get("data", [{}])[0]
-        new_row = _pd.DataFrame([{
-            "date":                 today,
-            "value":                int(data.get("value", 50)),
-            "value_classification": data.get("value_classification", "Neutral"),
-        }])
-        if os.path.exists(FEAR_GREED_PATH):
-            new_row.to_csv(FEAR_GREED_PATH, mode="a", header=False, index=False)
-        else:
-            new_row.to_csv(FEAR_GREED_PATH, index=False)
-        print(f"[FearGreed] Today: {data.get('value_classification')} ({data.get('value')})", flush=True)
-        return True
-    except Exception as e:
-        print(f"[FearGreed] Update failed: {e}", flush=True)
-        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

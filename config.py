@@ -14,7 +14,8 @@ HORIZON_BILSTM = 60     # 1 hour — ACB model predicts 1h direction
 HORIZON_META   = 60     # 1 hour — meta actionable signal
 
 # ── TFT architecture ──────────────────────────────────────────────────────────
-D_MODEL        = 32
+D_MODEL        = 64    # was 32 — 4x more parameters, same memory (attention is seq×seq not d_model)
+N_ENSEMBLE     = 3     # seeds per model — predictions averaged for XGBoost and inference
 N_HEADS        = 4
 DROPOUT_TFT    = 0.3
 N_EPOCHS_TFT   = 100

@@ -149,13 +149,13 @@ def run_training(force: bool = False, test_mode: bool = False):
         tft_val_err = 1.0 - _saved_acc.get("tft_val", tft_acc)
         print(f"[1/3] TFT already trained — skipping  (saved acc: {tft_acc:.3f})")
     else:
-        print(f"[1/3] Training TFT (macro, SEQ_LEN={tft_model.SEQ_LEN}, HORIZON={tft_model.HORIZON})...")
-        t_tft       = time.time()
-        tft_results = tft_model.train(df, TFT_DYN_FEATURES, TFT_STA_FEATURES)
-        tft_elapsed = time.time() - t_tft
-        tft_acc     = tft_results["test_acc"]
-        tft_val_err = 1.0 - tft_results.get("val_acc", tft_acc)
-        print(f"\nTFT complete | Accuracy: {tft_acc:.3f} | Val error: {tft_val_err:.4f} | Time: {_fmt(tft_elapsed)}")
+        print(f"[1/3] Training TFT ensemble ({tft_model.N_ENSEMBLE} seeds, SEQ_LEN={tft_model.SEQ_LEN}, HORIZON={tft_model.HORIZON})...")
+        t_tft        = time.time()
+        tft_results  = tft_model.train_ensemble(df, TFT_DYN_FEATURES, TFT_STA_FEATURES)
+        tft_elapsed  = time.time() - t_tft
+        tft_acc      = float(np.mean([r["test_acc"] for r in tft_results]))
+        tft_val_err  = 1.0 - float(np.mean([r.get("val_acc", r["test_acc"]) for r in tft_results]))
+        print(f"\nTFT ensemble complete | Avg accuracy: {tft_acc:.3f} | Time: {_fmt(tft_elapsed)}")
     print()
 
     # ── Phase 2: Train BiLSTM/ACB ─────────────────────────────────────────────
@@ -164,13 +164,13 @@ def run_training(force: bool = False, test_mode: bool = False):
         bilstm_val_err = 1.0 - _saved_acc.get("bilstm_val", bilstm_acc)
         print(f"[2/3] BiLSTM already trained — skipping  (saved acc: {bilstm_acc:.3f})")
     else:
-        print(f"[2/3] Training BiLSTM/ACB (micro, SEQ_LEN={bilstm_model.SEQ_LEN}, HORIZON={bilstm_model.HORIZON})...")
-        t_bilstm       = time.time()
-        bilstm_results = bilstm_model.train(df, BILSTM_FEATURES)
-        bilstm_elapsed = time.time() - t_bilstm
-        bilstm_acc     = bilstm_results["test_acc"]
-        bilstm_val_err = 1.0 - bilstm_results.get("val_acc", bilstm_acc)
-        print(f"\nBiLSTM complete | Accuracy: {bilstm_acc:.3f} | Val error: {bilstm_val_err:.4f} | Time: {_fmt(bilstm_elapsed)}")
+        print(f"[2/3] Training BiLSTM ensemble ({bilstm_model.N_ENSEMBLE} seeds, SEQ_LEN={bilstm_model.SEQ_LEN}, HORIZON={bilstm_model.HORIZON})...")
+        t_bilstm        = time.time()
+        bilstm_results  = bilstm_model.train_ensemble(df, BILSTM_FEATURES)
+        bilstm_elapsed  = time.time() - t_bilstm
+        bilstm_acc      = float(np.mean([r["test_acc"] for r in bilstm_results]))
+        bilstm_val_err  = 1.0 - float(np.mean([r.get("val_acc", r["test_acc"]) for r in bilstm_results]))
+        print(f"\nBiLSTM ensemble complete | Avg accuracy: {bilstm_acc:.3f} | Time: {_fmt(bilstm_elapsed)}")
     print()
 
     # ── Phase 3: OOF predictions → train meta ────────────────────────────────

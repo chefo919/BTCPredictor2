@@ -20,12 +20,18 @@ ROOT           = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from config import (SEQ_LEN_BILSTM as SEQ_LEN, HORIZON_BILSTM as HORIZON,
                     N_EPOCHS_BILSTM as N_EPOCHS, BATCH_BILSTM as BATCH,
-                    STRIDE_BILSTM as STRIDE, DROPOUT_BILSTM as DROPOUT)
+                    STRIDE_BILSTM as STRIDE, DROPOUT_BILSTM as DROPOUT,
+                    N_ENSEMBLE)
 
 MODEL_DIR      = os.path.join(ROOT, "models", "saved")
 MODEL_PATH     = os.path.join(MODEL_DIR, "bilstm.keras")
 SCALER_PATH    = os.path.join(MODEL_DIR, "bilstm_scaler.pkl")
 CHECKPOINT_DIR = os.path.join(MODEL_DIR, "checkpoints_bilstm")
+
+def _seed_model_path(s):  return os.path.join(MODEL_DIR, f"bilstm_s{s}.keras")
+def _seed_scaler_path(s): return os.path.join(MODEL_DIR, f"bilstm_scaler_s{s}.pkl")
+def _seed_ckpt_dir(s):    return os.path.join(MODEL_DIR, f"checkpoints_bilstm_s{s}")
+def _ensemble_ready():    return all(os.path.exists(_seed_model_path(s)) for s in range(N_ENSEMBLE))
 
 # Feature indices within the 1m/15m/30m feature block (30 features total)
 # 1m features are first 10: rsi(0), macd_diff_pct(1), ema9(2), ema21(3), ema50(4),
@@ -96,10 +102,11 @@ class _CheckpointCB(tf.keras.callbacks.Callback):
             self.model.save(path)
 
 
-def _latest_checkpoint() -> tuple:
-    if not os.path.exists(CHECKPOINT_DIR):
+def _latest_checkpoint(ckpt_dir=None) -> tuple:
+    ckpt_dir = ckpt_dir or CHECKPOINT_DIR
+    if not os.path.exists(ckpt_dir):
         return None, 0
-    files = [f for f in os.listdir(CHECKPOINT_DIR)
+    files = [f for f in os.listdir(ckpt_dir)
              if f.startswith("bilstm_epoch_") and f.endswith(".keras")]
     if not files:
         return None, 0
@@ -111,7 +118,7 @@ def _latest_checkpoint() -> tuple:
                 best_ep, best = ep, f
         except (IndexError, ValueError):
             continue
-    return (os.path.join(CHECKPOINT_DIR, best), best_ep) if best else (None, 0)
+    return (os.path.join(ckpt_dir, best), best_ep) if best else (None, 0)
 
 
 def _custom_objects():
@@ -144,9 +151,18 @@ def build_model(n_features: int) -> tf.keras.Model:
     return model
 
 
-def train(feature_df, feature_cols: list) -> dict:
+def train(feature_df, feature_cols: list, seed: int = None) -> dict:
     import time
     from sklearn.preprocessing import StandardScaler
+
+    if seed is not None:
+        import tensorflow as _tf
+        _tf.random.set_seed(seed)
+        np.random.seed(seed)
+
+    _model_path  = _seed_model_path(seed) if seed is not None else MODEL_PATH
+    _scaler_path = _seed_scaler_path(seed) if seed is not None else SCALER_PATH
+    _ckpt_dir    = _seed_ckpt_dir(seed)   if seed is not None else CHECKPOINT_DIR
 
     t0 = time.time()
 
@@ -191,8 +207,8 @@ def train(feature_df, feature_cols: list) -> dict:
     val_ds   = make_ds(X_val,   y, train_end, val_end)
     test_ds  = make_ds(X_test,  y, val_end, n)
 
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    ckpt_path, start_epoch = _latest_checkpoint()
+    os.makedirs(_ckpt_dir, exist_ok=True)
+    ckpt_path, start_epoch = _latest_checkpoint(_ckpt_dir)
     n_features = len(feature_cols)
     if ckpt_path:
         try:
@@ -243,7 +259,7 @@ def train(feature_df, feature_cols: list) -> dict:
         _ProgressCB(),
         tf.keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True),
         tf.keras.callbacks.ReduceLROnPlateau(patience=4, factor=0.3, min_lr=1e-6, verbose=0),
-        _CheckpointCB(CHECKPOINT_DIR, "bilstm", every_n=5),
+        _CheckpointCB(_ckpt_dir, "bilstm", every_n=5),
     ]
 
     history = model.fit(train_ds, validation_data=val_ds,
@@ -254,41 +270,79 @@ def train(feature_df, feature_cols: list) -> dict:
     _, test_acc = model.evaluate(test_ds, verbose=0)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
-    model.save(MODEL_PATH)
-    joblib.dump(scaler, SCALER_PATH)
+    model.save(_model_path)
+    joblib.dump(scaler, _scaler_path)
+    if seed is None:
+        model.save(MODEL_PATH)
+        joblib.dump(scaler, SCALER_PATH)
 
     return {"test_acc": float(test_acc), "val_acc": float(val_acc),
             "time_taken": time.time() - t0}
 
 
+def train_ensemble(feature_df, feature_cols: list) -> list:
+    """Train N_ENSEMBLE seeds and return list of results."""
+    results = []
+    for s in range(N_ENSEMBLE):
+        print(f"\n{'='*50}", flush=True)
+        print(f"BiLSTM ENSEMBLE — seed {s+1}/{N_ENSEMBLE}", flush=True)
+        print(f"{'='*50}", flush=True)
+        r = train(feature_df, feature_cols, seed=s)
+        results.append(r)
+        print(f"  Seed {s}: val={r['val_acc']:.4f}  test={r['test_acc']:.4f}", flush=True)
+    avg_val  = float(np.mean([r["val_acc"]  for r in results]))
+    avg_test = float(np.mean([r["test_acc"] for r in results]))
+    print(f"\n  Ensemble average: val={avg_val:.4f}  test={avg_test:.4f}", flush=True)
+    return results
+
+
+def _infer_batch_single(model, scaler, X_all, batch_size):
+    X_sc  = scaler.transform(X_all).astype(np.float32)
+    n     = len(X_sc)
+    probs = np.full(n, 0.5, dtype=np.float32)
+    n_batches = max(1, (n - SEQ_LEN + batch_size - 1) // batch_size)
+    for b in range(n_batches):
+        b_start = b * batch_size
+        b_end   = min(b_start + batch_size, n - SEQ_LEN)
+        if b_start >= b_end:
+            break
+        abs_idx = np.arange(SEQ_LEN + b_start, SEQ_LEN + b_end)
+        win_idx = abs_idx[:, None] + np.arange(-SEQ_LEN + 1, 1)[None, :]
+        preds   = model.predict(X_sc[win_idx], verbose=0, batch_size=batch_size)
+        probs[SEQ_LEN + b_start: SEQ_LEN + b_end] = preds.flatten()
+    return probs
+
+
 def predict_proba(X_seq: np.ndarray, feature_cols: list = None) -> float:
+    X_in = X_seq[-SEQ_LEN:]
+    if _ensemble_ready():
+        preds = []
+        for s in range(N_ENSEMBLE):
+            m  = tf.keras.models.load_model(_seed_model_path(s), custom_objects=_custom_objects())
+            sc = joblib.load(_seed_scaler_path(s))
+            inp = sc.transform(X_in).astype(np.float32).reshape(1, SEQ_LEN, -1)
+            preds.append(float(m.predict(inp, verbose=0)[0][0]))
+            del m
+        return float(np.mean(preds))
     model  = tf.keras.models.load_model(MODEL_PATH, custom_objects=_custom_objects())
     scaler = joblib.load(SCALER_PATH)
-    Xs  = scaler.transform(X_seq).astype(np.float32)
-    inp = Xs[-SEQ_LEN:].reshape(1, SEQ_LEN, -1)
+    inp    = scaler.transform(X_in).astype(np.float32).reshape(1, SEQ_LEN, -1)
     return float(model.predict(inp, verbose=0)[0][0])
 
 
 def predict_proba_batch(X_all: np.ndarray, feature_cols: list = None,
                          batch_size: int = 512) -> np.ndarray:
+    if _ensemble_ready():
+        all_probs = []
+        for s in range(N_ENSEMBLE):
+            m  = tf.keras.models.load_model(_seed_model_path(s), custom_objects=_custom_objects())
+            sc = joblib.load(_seed_scaler_path(s))
+            all_probs.append(_infer_batch_single(m, sc, X_all, batch_size))
+            del m
+        return np.mean(all_probs, axis=0)
     model  = tf.keras.models.load_model(MODEL_PATH, custom_objects=_custom_objects())
     scaler = joblib.load(SCALER_PATH)
-
-    X_sc  = scaler.transform(X_all).astype(np.float32)
-    n     = len(X_sc)
-    probs = np.full(n, 0.5, dtype=np.float32)
-
-    n_batches = (n - SEQ_LEN + batch_size - 1) // batch_size
-    for b in range(n_batches):
-        b_start = b * batch_size
-        b_end   = min(b_start + batch_size, n - SEQ_LEN)
-        abs_idx = np.arange(SEQ_LEN + b_start, SEQ_LEN + b_end)
-        win_idx = abs_idx[:, None] + np.arange(-SEQ_LEN + 1, 1)[None, :]
-        batch_X = X_sc[win_idx]
-        preds   = model.predict(batch_X, verbose=0, batch_size=batch_size)
-        probs[SEQ_LEN + b_start: SEQ_LEN + b_end] = preds.flatten()
-
-    return probs
+    return _infer_batch_single(model, scaler, X_all, batch_size)
 
 
 def is_trained() -> bool:

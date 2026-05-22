@@ -20,7 +20,8 @@ ROOT           = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from config import (SEQ_LEN_TFT as SEQ_LEN, HORIZON_TFT as HORIZON,
                     N_EPOCHS_TFT as N_EPOCHS, BATCH_TFT as BATCH,
-                    STRIDE_TFT as STRIDE, D_MODEL, N_HEADS, DROPOUT_TFT as DROPOUT)
+                    STRIDE_TFT as STRIDE, D_MODEL, N_HEADS, DROPOUT_TFT as DROPOUT,
+                    N_ENSEMBLE)
 
 # TFT trains and infers on hourly-downsampled data.
 # The input DataFrame is always at 1-minute resolution; we take every DOWNSAMPLE-th row
@@ -33,6 +34,11 @@ MODEL_PATH       = os.path.join(MODEL_DIR, "tft.keras")
 SCALER_PATH      = os.path.join(MODEL_DIR, "tft_scaler.pkl")
 CHECKPOINT_DIR   = os.path.join(MODEL_DIR, "checkpoints_tft")
 N_STATIC_PATH    = os.path.join(MODEL_DIR, "tft_n_static.txt")
+
+def _seed_model_path(s):  return os.path.join(MODEL_DIR, f"tft_s{s}.keras")
+def _seed_scaler_path(s): return os.path.join(MODEL_DIR, f"tft_scaler_s{s}.pkl")
+def _seed_ckpt_dir(s):    return os.path.join(MODEL_DIR, f"checkpoints_tft_s{s}")
+def _ensemble_ready():    return all(os.path.exists(_seed_model_path(s)) for s in range(N_ENSEMBLE))
 
 
 import tensorflow as tf
@@ -188,10 +194,11 @@ class _CheckpointCB(tf.keras.callbacks.Callback):
             self.model.save(path)
 
 
-def _latest_checkpoint() -> tuple:
-    if not os.path.exists(CHECKPOINT_DIR):
+def _latest_checkpoint(ckpt_dir=None) -> tuple:
+    ckpt_dir = ckpt_dir or CHECKPOINT_DIR
+    if not os.path.exists(ckpt_dir):
         return None, 0
-    files = [f for f in os.listdir(CHECKPOINT_DIR)
+    files = [f for f in os.listdir(ckpt_dir)
              if f.startswith("tft_epoch_") and f.endswith(".keras")]
     if not files:
         return None, 0
@@ -203,16 +210,25 @@ def _latest_checkpoint() -> tuple:
                 best_ep, best = ep, f
         except (IndexError, ValueError):
             continue
-    return (os.path.join(CHECKPOINT_DIR, best), best_ep) if best else (None, 0)
+    return (os.path.join(ckpt_dir, best), best_ep) if best else (None, 0)
 
 
 def _custom_objects():
     return {"GRN": GRN, "VSN": VSN, "_StaticGRN": _StaticGRN}
 
 
-def train(feature_df, dynamic_cols: list, static_cols: list) -> dict:
+def train(feature_df, dynamic_cols: list, static_cols: list,
+          seed: int = None) -> dict:
     import time
     from sklearn.preprocessing import StandardScaler
+
+    if seed is not None:
+        tf.random.set_seed(seed)
+        np.random.seed(seed)
+
+    _model_path  = _seed_model_path(seed) if seed is not None else MODEL_PATH
+    _scaler_path = _seed_scaler_path(seed) if seed is not None else SCALER_PATH
+    _ckpt_dir    = _seed_ckpt_dir(seed)   if seed is not None else CHECKPOINT_DIR
 
     t0 = time.time()
 
@@ -268,15 +284,16 @@ def train(feature_df, dynamic_cols: list, static_cols: list) -> dict:
     test_ds  = make_ds(X_test,  y, val_end, n)
 
     # ── Checkpoint resume ─────────────────────────────────────────────────────
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    ckpt_path, start_epoch = _latest_checkpoint()
+    os.makedirs(_ckpt_dir, exist_ok=True)
+    ckpt_path, start_epoch = _latest_checkpoint(_ckpt_dir)
     expected_shape = (SEQ_LEN, n_dynamic + n_static)
     if ckpt_path:
         try:
             loaded = tf.keras.models.load_model(ckpt_path, custom_objects=_custom_objects())
             if tuple(loaded.input_shape[1:]) == expected_shape:
                 model = loaded
-                print(f"  Resuming TFT from checkpoint epoch {start_epoch}", flush=True)
+                lbl = f"seed {seed}" if seed is not None else "TFT"
+                print(f"  Resuming {lbl} from checkpoint epoch {start_epoch}", flush=True)
             else:
                 print(f"  Checkpoint shape mismatch — starting fresh.", flush=True)
                 model = build_model(n_dynamic, n_static)
@@ -320,7 +337,7 @@ def train(feature_df, dynamic_cols: list, static_cols: list) -> dict:
         _ProgressCB(),
         tf.keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True),
         tf.keras.callbacks.ReduceLROnPlateau(patience=4, factor=0.3, min_lr=1e-6, verbose=0),
-        _CheckpointCB(CHECKPOINT_DIR, "tft", every_n=5),
+        _CheckpointCB(_ckpt_dir, "tft", every_n=5),
     ]
 
     history = model.fit(train_ds, validation_data=val_ds,
@@ -331,14 +348,33 @@ def train(feature_df, dynamic_cols: list, static_cols: list) -> dict:
     _, test_acc = model.evaluate(test_ds, verbose=0)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
-    model.save(MODEL_PATH)
-    joblib.dump(scaler, SCALER_PATH)
-    # Save n_static so inference knows the split
+    model.save(_model_path)
+    joblib.dump(scaler, _scaler_path)
     with open(N_STATIC_PATH, "w") as f:
         f.write(str(n_static))
+    # Also save to primary path when no seed (backward compat)
+    if seed is None:
+        model.save(MODEL_PATH)
+        joblib.dump(scaler, SCALER_PATH)
 
     return {"test_acc": float(test_acc), "val_acc": float(val_acc),
             "time_taken": time.time() - t0}
+
+
+def train_ensemble(feature_df, dynamic_cols: list, static_cols: list) -> list:
+    """Train N_ENSEMBLE seeds and return list of results. Predictions are averaged at inference."""
+    results = []
+    for s in range(N_ENSEMBLE):
+        print(f"\n{'='*50}", flush=True)
+        print(f"TFT ENSEMBLE — seed {s+1}/{N_ENSEMBLE}", flush=True)
+        print(f"{'='*50}", flush=True)
+        r = train(feature_df, dynamic_cols, static_cols, seed=s)
+        results.append(r)
+        print(f"  Seed {s}: val={r['val_acc']:.4f}  test={r['test_acc']:.4f}", flush=True)
+    avg_val  = float(np.mean([r["val_acc"]  for r in results]))
+    avg_test = float(np.mean([r["test_acc"] for r in results]))
+    print(f"\n  Ensemble average: val={avg_val:.4f}  test={avg_test:.4f}", flush=True)
+    return results
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
@@ -350,25 +386,13 @@ def _load_n_static() -> int:
     return 0    # default: no static covariates
 
 
-def predict_proba_batch(X_dynamic: np.ndarray, X_static: np.ndarray,
-                         batch_size: int = 512) -> np.ndarray:
-    """
-    Batch inference on minute-resolution input arrays.
-    Downsamples to hourly internally before building SEQ_LEN=240 windows.
-    X_dynamic: (n_minutes, n_dyn) — must have n_minutes >= SEQ_LEN * DOWNSAMPLE.
-    Returns probabilities aligned to the original minute-level rows (hourly rows
-    get a valid prob; intermediate minute rows are filled with 0.5).
-    """
-    model  = tf.keras.models.load_model(MODEL_PATH, custom_objects=_custom_objects())
-    scaler = joblib.load(SCALER_PATH)
-
+def _infer_batch(model, scaler, X_dynamic, X_static, batch_size):
+    """Run batch inference for one model (shared by single and ensemble paths)."""
     X_all    = np.concatenate([X_dynamic, X_static], axis=1)
-    # Downsample to hourly — same as training
     X_hourly = X_all[::DOWNSAMPLE]
     X_sc     = scaler.transform(X_hourly).astype(np.float32)
     n        = len(X_sc)
     probs_h  = np.full(n, 0.5, dtype=np.float32)
-
     n_batches = max(1, (n - SEQ_LEN + batch_size - 1) // batch_size)
     for b in range(n_batches):
         b_start = b * batch_size
@@ -379,30 +403,56 @@ def predict_proba_batch(X_dynamic: np.ndarray, X_static: np.ndarray,
         win_idx = abs_idx[:, None] + np.arange(-SEQ_LEN + 1, 1)[None, :]
         preds   = model.predict(X_sc[win_idx], verbose=0, batch_size=batch_size)
         probs_h[SEQ_LEN + b_start: SEQ_LEN + b_end] = preds.flatten()
-
-    # Map hourly probs back to minute resolution
     probs_m = np.full(len(X_all), 0.5, dtype=np.float32)
     for i, p in enumerate(probs_h):
         probs_m[i * DOWNSAMPLE] = p
     return probs_m
 
 
-def predict_proba(X_dynamic: np.ndarray, X_static: np.ndarray) -> float:
+def predict_proba_batch(X_dynamic: np.ndarray, X_static: np.ndarray,
+                         batch_size: int = 512) -> np.ndarray:
     """
-    Single-sample inference on minute-resolution input.
-    Takes the last SEQ_LEN hourly samples (end-aligned so 'now' is always last).
-    X_dynamic must have at least SEQ_LEN * DOWNSAMPLE rows.
+    Batch inference. Auto-uses ensemble (N_ENSEMBLE seeds averaged) if trained,
+    otherwise falls back to single model. Downsamples to hourly internally.
     """
+    if _ensemble_ready():
+        all_probs = []
+        for s in range(N_ENSEMBLE):
+            m = tf.keras.models.load_model(_seed_model_path(s), custom_objects=_custom_objects())
+            sc = joblib.load(_seed_scaler_path(s))
+            all_probs.append(_infer_batch(m, sc, X_dynamic, X_static, batch_size))
+            del m
+        return np.mean(all_probs, axis=0)
+
     model  = tf.keras.models.load_model(MODEL_PATH, custom_objects=_custom_objects())
     scaler = joblib.load(SCALER_PATH)
-    X_all  = np.concatenate([X_dynamic, X_static], axis=1)
-    # End-aligned downsample: last row = now, stepping back DOWNSAMPLE each time
-    idx    = np.arange(len(X_all) - 1, -1, -DOWNSAMPLE)[::-1]
-    X_h    = X_all[idx][-SEQ_LEN:]
-    Xs     = scaler.transform(X_h).astype(np.float32)
-    inp    = Xs.reshape(1, SEQ_LEN, -1)
+    return _infer_batch(model, scaler, X_dynamic, X_static, batch_size)
+
+
+def predict_proba(X_dynamic: np.ndarray, X_static: np.ndarray) -> float:
+    """
+    Single-sample inference. Auto-uses ensemble if trained.
+    X_dynamic must have at least SEQ_LEN * DOWNSAMPLE rows.
+    """
+    X_all = np.concatenate([X_dynamic, X_static], axis=1)
+    idx   = np.arange(len(X_all) - 1, -1, -DOWNSAMPLE)[::-1]
+    X_h   = X_all[idx][-SEQ_LEN:]
+
+    if _ensemble_ready():
+        preds = []
+        for s in range(N_ENSEMBLE):
+            m  = tf.keras.models.load_model(_seed_model_path(s), custom_objects=_custom_objects())
+            sc = joblib.load(_seed_scaler_path(s))
+            inp = sc.transform(X_h).astype(np.float32).reshape(1, SEQ_LEN, -1)
+            preds.append(float(m.predict(inp, verbose=0)[0][0]))
+            del m
+        return float(np.mean(preds))
+
+    model  = tf.keras.models.load_model(MODEL_PATH, custom_objects=_custom_objects())
+    scaler = joblib.load(SCALER_PATH)
+    inp    = scaler.transform(X_h).astype(np.float32).reshape(1, SEQ_LEN, -1)
     return float(model.predict(inp, verbose=0)[0][0])
 
 
 def is_trained() -> bool:
-    return os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH)
+    return _ensemble_ready() or (os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH))

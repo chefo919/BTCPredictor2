@@ -5,7 +5,7 @@ Change a value once — it propagates everywhere automatically.
 """
 
 # ── Sequence lengths (lookback windows) ──────────────────────────────────────
-SEQ_LEN_TFT    = 240    # 240 hourly steps = 10 days macro context (downsampled from 1m)
+SEQ_LEN_TFT    = 480    # 480 x 30min steps = 10 days macro context (downsampled from 1m)
 SEQ_LEN_BILSTM = 240    # 240 minute steps = 4 hours short-term momentum
 
 # ── Prediction horizons ───────────────────────────────────────────────────────
@@ -18,7 +18,7 @@ D_MODEL        = 32
 N_HEADS        = 4
 DROPOUT_TFT    = 0.3
 N_EPOCHS_TFT   = 100
-BATCH_TFT      = 32     # CPU-safe: attention [32,4,240,240] = trivial. Colab overrides to 512.
+BATCH_TFT      = 32     # CPU-safe: attention [32,4,480,480] = ~118 MB. Colab overrides to 512.
 STRIDE_TFT     = 1      # hourly-downsampled data — stride 1 = one sequence per hour
 
 # ── BiLSTM architecture ───────────────────────────────────────────────────────

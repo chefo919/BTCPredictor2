@@ -28,6 +28,7 @@ _groups          = get_feature_groups()
 BILSTM_FEATURES  = _groups["bilstm"]
 TFT_DYN_FEATURES = _groups["tft_dynamic"]
 TFT_STA_FEATURES = _groups["tft_static"]
+ACTIVE_FEATURES  = BILSTM_FEATURES + TFT_DYN_FEATURES + TFT_STA_FEATURES
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 ROOT          = os.path.dirname(os.path.dirname(__file__))
@@ -68,17 +69,24 @@ def _load_models():
     bilstm_m = tf.keras.models.load_model(bi_path,
                    custom_objects={"_SumPool": _SumPool, "_PVAttention": _PVAttention})
     bilstm_s = joblib.load(bi_s_path)
-    meta_m   = joblib.load(meta_path)["model"]
-    meta_w   = joblib.load(meta_path)["weights"]
-    print(f"[Backtest] Models loaded — TFT weight: {meta_w['tft']:.3f}  BiLSTM weight: {meta_w['bilstm']:.3f}",
-          flush=True)
-    return tft_m, tft_s, bilstm_m, bilstm_s, meta_m, meta_w
+
+    # Support both old format (keys: model, weights) and new routing format
+    meta_saved = joblib.load(meta_path)
+    meta_w = meta_saved.get("static_weights", meta_saved.get("weights", {"tft": 0.5, "bilstm": 0.5}))
+    n_dis  = meta_saved.get("n_disagree", 0)
+    thresh = meta_saved.get("agree_thresh", 0.10)
+    has_gate = meta_saved.get("gate_model") is not None
+    print(f"[Backtest] Models loaded — static weights TFT: {meta_w['tft']:.3f}  "
+          f"BiLSTM: {meta_w['bilstm']:.3f}  "
+          f"gate: {'active' if has_gate else 'off'} "
+          f"({n_dis:,} training rows, thresh={thresh})", flush=True)
+    return tft_m, tft_s, bilstm_m, bilstm_s, meta_w
 
 
 # ── Batch inference ───────────────────────────────────────────────────────────
 
 def _batch_infer(X_tft_dyn, X_tft_sta, X_bi, times_all, first_idx,
-                  tft_m, tft_s, bilstm_m, bilstm_s, meta_m, meta_w, df):
+                  tft_m, tft_s, bilstm_m, bilstm_s, meta_w, df):
     n          = len(X_tft_dyn) - first_idx
     n_batches  = (n + INFER_BATCH - 1) // INFER_BATCH
     SEQ_BILSTM = _bilstm_mod.SEQ_LEN
@@ -123,9 +131,8 @@ def _batch_infer(X_tft_dyn, X_tft_sta, X_bi, times_all, first_idx,
             last_pct = pct
     del bilstm_sc
 
-    # ── XGBoost meta-learner ──────────────────────────────────────────────────
-    print("[Backtest] Running meta-learner...", flush=True)
-    w_tft, w_bilstm = meta_w["tft"], meta_w["bilstm"]
+    # ── Agreement-based routing meta-learner ─────────────────────────────────
+    print("[Backtest] Running meta-learner (agreement-based routing)...", flush=True)
     final_probs = _meta_mod.predict_proba_batch(tft_probs, bilstm_probs,
                                                   df.iloc[first_idx:].reset_index(drop=True),
                                                   ACTIVE_FEATURES)
@@ -465,7 +472,7 @@ def main():
     n         = len(df) - first_idx
     print(f"[Backtest] {n:,} rows to process", flush=True)
 
-    tft_m, tft_s, bilstm_m, bilstm_s, meta_m, meta_w = _load_models()
+    tft_m, tft_s, bilstm_m, bilstm_s, meta_w = _load_models()
 
     X_tft_dyn = df[TFT_DYN_FEATURES].values.astype(np.float32)
     X_tft_sta = df[TFT_STA_FEATURES].values.astype(np.float32)
@@ -473,7 +480,7 @@ def main():
     times_all = df["time"].values
 
     final_probs = _batch_infer(X_tft_dyn, X_tft_sta, X_bi, times_all, first_idx,
-                                tft_m, tft_s, bilstm_m, bilstm_s, meta_m, meta_w, df)
+                                tft_m, tft_s, bilstm_m, bilstm_s, meta_w, df)
 
     print("[Backtest] Simulating trades...", flush=True)
     result = _simulate(df, first_idx, final_probs, args.capital)

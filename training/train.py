@@ -228,11 +228,14 @@ def run_training(force: bool = False, test_mode: bool = False):
     print()
     print(SEP)
     print("TFT-ACB-XML Training complete!")
-    print(f"[Training] TFT accuracy:    {tft_acc:.3f}")
-    print(f"[Training] BiLSTM accuracy: {bilstm_acc:.3f}")
-    print(f"[Training] Meta accuracy:   {meta_results['train_acc']:.3f}")
+    print(f"[Training] TFT accuracy:      {tft_acc:.3f}  (ensemble of {tft_model.N_ENSEMBLE} seeds)")
+    print(f"[Training] BiLSTM accuracy:   {bilstm_acc:.3f}  (ensemble of {bilstm_model.N_ENSEMBLE} seeds)")
+    print(f"[Training] Meta routing acc:  {meta_results['train_acc']:.3f}  (OOF, agreement-based gate)")
+    print(f"[Training] Gate CV acc:       {meta_results.get('gate_cv_acc', 0):.3f}  "
+          f"(on {meta_results.get('n_disagree', 0):,} disagreement rows, "
+          f"{meta_results.get('pct_disagree', 0):.1f}% of OOF)")
     w = meta_results.get("weights", {})
-    print(f"[Training] Error-reciprocal weights — TFT: {w.get('tft',0):.3f}  BiLSTM: {w.get('bilstm',0):.3f}")
+    print(f"[Training] Static fallback — TFT: {w.get('tft',0):.3f}  BiLSTM: {w.get('bilstm',0):.3f}")
     print(f"[Training] Data window: {TRAINING_START} -> {TRAINING_CUTOFF_DATE}")
     print(f"Models saved to:  models/saved/")
     print(f"Total time:       {_fmt(total_elapsed)}")

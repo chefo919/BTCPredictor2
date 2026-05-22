@@ -27,12 +27,20 @@ MODEL_DIR  = os.path.join(ROOT, "models", "saved")
 MODEL_PATH = os.path.join(MODEL_DIR, "meta_xgb.pkl")
 
 META_RAW_FEATURES = [
-    "d1_rsi", "h4_rsi", "h1_rsi", "m30_rsi",
-    "d1_ema9_ratio", "d1_ema50_ratio",
-    "h4_atr_norm",       # volatility regime — high = trending, trust signals more
-    "h1_vol_ratio",      # volume conviction
-    "h4_bb_width",       # band width = volatility proxy
-    "d1_macd_diff_pct",  # macro momentum direction
+    # Micro snapshot — market context when BiLSTM makes its short-term call
+    "rsi",              # 1m immediate momentum
+    "m15_rsi",          # 15m short-term momentum
+    "vol_ratio",        # 1m volume anomaly (spike = conviction)
+    "body_ratio",       # 1m candle direction intensity
+    # Macro snapshot — market context when TFT makes its 7-day-context call
+    "h1_rsi",           # 1H momentum
+    "h4_rsi",           # 4H momentum
+    "d1_rsi",           # 1D macro regime
+    "h1_atr_norm",      # 1H volatility
+    "h4_atr_norm",      # 4H volatility
+    "d1_macd_diff_pct", # macro trend direction
+    "h4_adx",           # trend strength (is market trending or ranging?)
+    "h1_bb_width",      # intraday volatility regime
 ]
 
 
@@ -110,15 +118,28 @@ def train(val_df: pd.DataFrame,
     print(f"  Meta-learner training: {len(y_meta):,} rows  "
           f"label balance: {y_meta.mean():.3f}", flush=True)
 
-    model = xgb.XGBClassifier(
-        n_estimators=200, max_depth=3, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8,
-        eval_metric="logloss", verbosity=0,
-    )
+    from sklearn.model_selection import TimeSeriesSplit
+
+    xgb_params = dict(n_estimators=300, max_depth=3, learning_rate=0.05,
+                      subsample=0.8, colsample_bytree=0.8, verbosity=0)
+
+    # TimeSeriesSplit CV — each fold's val is always AFTER its train (no future leakage)
+    tscv = TimeSeriesSplit(n_splits=3)
+    cv_scores = []
+    for fold, (tr_idx, va_idx) in enumerate(tscv.split(X_meta), 1):
+        m = xgb.XGBClassifier(**xgb_params)
+        m.fit(X_meta[tr_idx], y_meta[tr_idx])
+        fold_acc = accuracy_score(y_meta[va_idx], m.predict(X_meta[va_idx]))
+        cv_scores.append(fold_acc)
+        print(f"  CV fold {fold}/3: {fold_acc:.4f}", flush=True)
+
+    cv_mean = float(np.mean(cv_scores))
+    print(f"  TimeSeriesSplit CV: {cv_mean:.4f} +/- {np.std(cv_scores):.4f}", flush=True)
+
+    # Final model trained on all OOF data
+    model = xgb.XGBClassifier(**xgb_params)
     model.fit(X_meta, y_meta)
-    preds = model.predict(X_meta)
-    train_acc = float(accuracy_score(y_meta, preds))
-    print(f"  Meta-learner train accuracy: {train_acc:.4f}", flush=True)
+    train_acc = cv_mean   # honest CV accuracy, not inflated train-set accuracy
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     joblib.dump({

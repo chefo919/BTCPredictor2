@@ -174,28 +174,39 @@ def run_training(force: bool = False, test_mode: bool = False):
     print()
 
     # ── Phase 3: OOF predictions → train meta ────────────────────────────────
+    # Timeline: [0-70% train] [+24h gap] [72-90% OOF] [+24h gap] [92-100% test]
+    # 24h purge gaps prevent training labels from referencing OOF prices and vice versa.
     print("[3/3] Generating OOF predictions and training XGBoost meta-learner...")
     df_clean  = df.dropna(subset=ALL_NEEDED).reset_index(drop=True)
     n_total   = len(df_clean)
-    val_start = int(n_total * 0.70)
-    val_end   = int(n_total * 0.85)
-    df_val    = df_clean.iloc[val_start:val_end].copy()
+    PURGE     = 24 * 60   # 24-hour purge gap in 1-minute rows
 
-    val_X_dyn  = df_val[TFT_DYN_FEATURES].values.astype("float32")
-    val_X_sta  = df_val[TFT_STA_FEATURES].values.astype("float32")
-    val_X_bi   = df_val[BILSTM_FEATURES].values.astype("float32")
+    train_end  = int(n_total * 0.70)
+    oof_start  = train_end  + PURGE          # skip 24h after training ends
+    oof_end    = int(n_total * 0.90)
+    test_start = oof_end    + PURGE          # skip 24h between OOF and test
 
-    print(f"  Generating TFT OOF predictions on {len(df_val):,} rows...", flush=True)
+    df_oof  = df_clean.iloc[oof_start:oof_end].copy()    # ~19% — meta training
+    df_test = df_clean.iloc[test_start:].copy()           # ~9%  — final evaluation
+
+    print(f"  OOF window: rows {oof_start:,}-{oof_end:,} ({len(df_oof):,} rows, "
+          f"24h purge on each side)", flush=True)
+
+    val_X_dyn  = df_oof[TFT_DYN_FEATURES].values.astype("float32")
+    val_X_sta  = df_oof[TFT_STA_FEATURES].values.astype("float32")
+    val_X_bi   = df_oof[BILSTM_FEATURES].values.astype("float32")
+
+    print(f"  Generating TFT OOF predictions on {len(df_oof):,} rows...", flush=True)
     val_tft_probs    = tft_model.predict_proba_batch(val_X_dyn, val_X_sta)
-    print(f"  Generating BiLSTM OOF predictions on {len(df_val):,} rows...", flush=True)
+    print(f"  Generating BiLSTM OOF predictions on {len(df_oof):,} rows...", flush=True)
     val_bilstm_probs = bilstm_model.predict_proba_batch(val_X_bi)
 
     t_meta       = time.time()
-    meta_results = meta_model.train(df_val, val_tft_probs, val_bilstm_probs,
+    meta_results = meta_model.train(df_oof, val_tft_probs, val_bilstm_probs,
                                      tft_val_err, bilstm_val_err,
                                      TFT_DYN_FEATURES + TFT_STA_FEATURES)
     meta_elapsed = time.time() - t_meta
-    print(f"\nMeta-learner complete | Train acc: {meta_results['train_acc']:.3f} | "
+    print(f"\nMeta-learner complete | CV acc: {meta_results['train_acc']:.3f} | "
           f"Time: {_fmt(meta_elapsed)}")
 
     save_train_rows(current_rows)

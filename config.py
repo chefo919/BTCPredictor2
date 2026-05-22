@@ -5,7 +5,7 @@ Change a value once — it propagates everywhere automatically.
 """
 
 # ── Sequence lengths (lookback windows) ──────────────────────────────────────
-SEQ_LEN_TFT    = 480    # 480 x 30min steps = 10 days macro context (downsampled from 1m)
+SEQ_LEN_TFT    = 168    # 168 x 1h steps = 7 days macro context (hourly downsampled from 1m)
 SEQ_LEN_BILSTM = 240    # 240 minute steps = 4 hours short-term momentum
 
 # ── Prediction horizons ───────────────────────────────────────────────────────

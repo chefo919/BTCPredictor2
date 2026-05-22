@@ -26,7 +26,7 @@ from config import (SEQ_LEN_TFT as SEQ_LEN, HORIZON_TFT as HORIZON,
 # The input DataFrame is always at 1-minute resolution; we take every DOWNSAMPLE-th row
 # so each sequence step represents one hour of real time.
 # SEQ_LEN=240 × DOWNSAMPLE=60 = 14400 minutes (10 days) of macro context.
-DOWNSAMPLE = 30   # sample every 30 minutes: 480 steps x 30min = 10 days context
+DOWNSAMPLE = 60   # sample every 60 minutes (hourly): 168 steps x 1h = 7 days context
 
 MODEL_DIR        = os.path.join(ROOT, "models", "saved")
 MODEL_PATH       = os.path.join(MODEL_DIR, "tft.keras")

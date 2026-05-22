@@ -30,8 +30,10 @@ TFT_DYN_FEATURES = _groups["tft_dynamic"]
 TFT_STA_FEATURES = _groups["tft_static"]
 ALL_FEATURES     = BILSTM_FEATURES + TFT_DYN_FEATURES + TFT_STA_FEATURES
 
-# Load tail needs enough rows for the TFT (largest window)
-SEQ_LEN = tft_model.SEQ_LEN
+# TFT uses hourly-downsampled sequences: need SEQ_LEN * DOWNSAMPLE minutes of history
+SEQ_LEN    = tft_model.SEQ_LEN
+DOWNSAMPLE = tft_model.DOWNSAMPLE
+TFT_TAIL   = SEQ_LEN * DOWNSAMPLE + 200   # minutes needed for 240 hourly rows
 
 
 def _load_tail(path: str, n: int = 200) -> pd.DataFrame:
@@ -95,7 +97,7 @@ def generate_signal(fetch: bool = True) -> dict:
         update_data()
         update_features()
 
-    df = _load_yearly_tail(n=SEQ_LEN + 10)
+    df = _load_yearly_tail(n=TFT_TAIL)
     df = df.dropna(subset=ALL_FEATURES)
 
     if len(df) < SEQ_LEN:

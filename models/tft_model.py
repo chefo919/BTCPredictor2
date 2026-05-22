@@ -22,6 +22,12 @@ from config import (SEQ_LEN_TFT as SEQ_LEN, HORIZON_TFT as HORIZON,
                     N_EPOCHS_TFT as N_EPOCHS, BATCH_TFT as BATCH,
                     STRIDE_TFT as STRIDE, D_MODEL, N_HEADS, DROPOUT_TFT as DROPOUT)
 
+# TFT trains and infers on hourly-downsampled data.
+# The input DataFrame is always at 1-minute resolution; we take every DOWNSAMPLE-th row
+# so each sequence step represents one hour of real time.
+# SEQ_LEN=240 × DOWNSAMPLE=60 = 14400 minutes (10 days) of macro context.
+DOWNSAMPLE = 60
+
 MODEL_DIR        = os.path.join(ROOT, "models", "saved")
 MODEL_PATH       = os.path.join(MODEL_DIR, "tft.keras")
 SCALER_PATH      = os.path.join(MODEL_DIR, "tft_scaler.pkl")
@@ -214,7 +220,12 @@ def train(feature_df, dynamic_cols: list, static_cols: list) -> dict:
     df = feature_df.dropna(subset=all_cols).copy()
     df["target"] = (df["close"].shift(-HORIZON) > df["close"]).astype(int)
     df = df.dropna(subset=["target"])
-    print(f"  TFT training rows: {len(df):,}  label balance: {df['target'].mean():.3f}  "
+
+    # Downsample to hourly: every DOWNSAMPLE-th row so each sequence step = 1 hour.
+    # This gives TFT genuine temporal variation across its 240-step (10-day) window.
+    df = df.iloc[::DOWNSAMPLE].reset_index(drop=True)
+
+    print(f"  TFT training rows: {len(df):,} (hourly)  label balance: {df['target'].mean():.3f}  "
           f"dynamic={len(dynamic_cols)} static={len(static_cols)}", flush=True)
 
     X = df[all_cols].values   # [n, n_dynamic + n_static]
@@ -341,35 +352,55 @@ def _load_n_static() -> int:
 
 def predict_proba_batch(X_dynamic: np.ndarray, X_static: np.ndarray,
                          batch_size: int = 512) -> np.ndarray:
-    """Batch inference. X_dynamic: (n, n_dyn), X_static: (n, n_static)."""
+    """
+    Batch inference on minute-resolution input arrays.
+    Downsamples to hourly internally before building SEQ_LEN=240 windows.
+    X_dynamic: (n_minutes, n_dyn) — must have n_minutes >= SEQ_LEN * DOWNSAMPLE.
+    Returns probabilities aligned to the original minute-level rows (hourly rows
+    get a valid prob; intermediate minute rows are filled with 0.5).
+    """
     model  = tf.keras.models.load_model(MODEL_PATH, custom_objects=_custom_objects())
     scaler = joblib.load(SCALER_PATH)
 
-    X_all = np.concatenate([X_dynamic, X_static], axis=1)
-    X_sc  = scaler.transform(X_all).astype(np.float32)
-    n     = len(X_sc)
-    probs = np.full(n, 0.5, dtype=np.float32)
+    X_all    = np.concatenate([X_dynamic, X_static], axis=1)
+    # Downsample to hourly — same as training
+    X_hourly = X_all[::DOWNSAMPLE]
+    X_sc     = scaler.transform(X_hourly).astype(np.float32)
+    n        = len(X_sc)
+    probs_h  = np.full(n, 0.5, dtype=np.float32)
 
-    n_batches = (n - SEQ_LEN + batch_size - 1) // batch_size
+    n_batches = max(1, (n - SEQ_LEN + batch_size - 1) // batch_size)
     for b in range(n_batches):
         b_start = b * batch_size
         b_end   = min(b_start + batch_size, n - SEQ_LEN)
+        if b_start >= b_end:
+            break
         abs_idx = np.arange(SEQ_LEN + b_start, SEQ_LEN + b_end)
         win_idx = abs_idx[:, None] + np.arange(-SEQ_LEN + 1, 1)[None, :]
-        batch_X = X_sc[win_idx]
-        preds   = model.predict(batch_X, verbose=0, batch_size=batch_size)
-        probs[SEQ_LEN + b_start: SEQ_LEN + b_end] = preds.flatten()
+        preds   = model.predict(X_sc[win_idx], verbose=0, batch_size=batch_size)
+        probs_h[SEQ_LEN + b_start: SEQ_LEN + b_end] = preds.flatten()
 
-    return probs
+    # Map hourly probs back to minute resolution
+    probs_m = np.full(len(X_all), 0.5, dtype=np.float32)
+    for i, p in enumerate(probs_h):
+        probs_m[i * DOWNSAMPLE] = p
+    return probs_m
 
 
 def predict_proba(X_dynamic: np.ndarray, X_static: np.ndarray) -> float:
-    """Single-sample inference. Uses last SEQ_LEN rows of combined input."""
+    """
+    Single-sample inference on minute-resolution input.
+    Takes the last SEQ_LEN hourly samples (end-aligned so 'now' is always last).
+    X_dynamic must have at least SEQ_LEN * DOWNSAMPLE rows.
+    """
     model  = tf.keras.models.load_model(MODEL_PATH, custom_objects=_custom_objects())
     scaler = joblib.load(SCALER_PATH)
     X_all  = np.concatenate([X_dynamic, X_static], axis=1)
-    Xs     = scaler.transform(X_all).astype(np.float32)
-    inp    = Xs[-SEQ_LEN:].reshape(1, SEQ_LEN, -1)
+    # End-aligned downsample: last row = now, stepping back DOWNSAMPLE each time
+    idx    = np.arange(len(X_all) - 1, -1, -DOWNSAMPLE)[::-1]
+    X_h    = X_all[idx][-SEQ_LEN:]
+    Xs     = scaler.transform(X_h).astype(np.float32)
+    inp    = Xs.reshape(1, SEQ_LEN, -1)
     return float(model.predict(inp, verbose=0)[0][0])
 
 

@@ -5,8 +5,8 @@ Change a value once — it propagates everywhere automatically.
 """
 
 # ── Sequence lengths (lookback windows) ──────────────────────────────────────
-SEQ_LEN_TFT    = 1440   # 24 hours — macro context window (h1/h4/d1 features)
-SEQ_LEN_BILSTM = 240    # 4 hours  — short-term momentum window (1m/15m/30m features)
+SEQ_LEN_TFT    = 240    # 240 hourly steps = 10 days macro context (downsampled from 1m)
+SEQ_LEN_BILSTM = 240    # 240 minute steps = 4 hours short-term momentum
 
 # ── Prediction horizons ───────────────────────────────────────────────────────
 HORIZON_TFT    = 60     # 1 hour — macro model predicts 1h direction
@@ -18,8 +18,8 @@ D_MODEL        = 32
 N_HEADS        = 4
 DROPOUT_TFT    = 0.3
 N_EPOCHS_TFT   = 100
-BATCH_TFT      = 4      # CPU-safe: attention [4,4,1440,1440] = ~134 MB. Colab overrides to 256.
-STRIDE_TFT     = 60     # one prediction horizon per training step
+BATCH_TFT      = 32     # CPU-safe: attention [32,4,240,240] = trivial. Colab overrides to 512.
+STRIDE_TFT     = 1      # hourly-downsampled data — stride 1 = one sequence per hour
 
 # ── BiLSTM architecture ───────────────────────────────────────────────────────
 DROPOUT_BILSTM  = 0.5

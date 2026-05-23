@@ -6,7 +6,7 @@ Change a value once — it propagates everywhere automatically.
 
 # ── Sequence lengths (lookback windows) ──────────────────────────────────────
 SEQ_LEN_TFT    = 180    # 180 × 4h steps = 30 days macro context (4h-sampled tft_merged)
-SEQ_LEN_BILSTM = 96     # 96 × 15min steps = 24h short-term momentum (15min-sampled bilstm_merged)
+SEQ_LEN_BILSTM = 192    # 192 × 15min steps = 48h short-term momentum (15min-sampled bilstm_merged)
 
 # ── Prediction horizons ───────────────────────────────────────────────────────
 HORIZON_TFT    = 1440   # 1 day — macro model predicts 1-day direction
@@ -27,17 +27,18 @@ BATCH_TFT      = 32     # CPU-safe. Colab overrides to 512.
 STRIDE_TFT     = 1      # 4h-sampled data — stride 1 = one sequence per 4h step
 
 # ── BiLSTM architecture ───────────────────────────────────────────────────────
-DROPOUT_BILSTM  = 0.5
-N_EPOCHS_BILSTM = 100
-BATCH_BILSTM    = 16    # CPU-safe. Colab overrides to 512.
-STRIDE_BILSTM   = 4     # 1 sample per hour = every 4 steps in 15min-sampled data
+LSTM_UNITS_BILSTM = 64    # units per direction (64×2=128 total); was hardcoded 32 — underfitting
+DROPOUT_BILSTM    = 0.25  # was 0.5 — reduced to fix underfitting
+N_EPOCHS_BILSTM   = 100
+BATCH_BILSTM      = 16    # CPU-safe. Colab overrides to 512.
+STRIDE_BILSTM     = 4     # 1 sample per hour = every 4 steps in 15min-sampled data
 
 # ── Training ──────────────────────────────────────────────────────────────────
 TRAINING_CUTOFF_DATE = "2026-04-15"
 
 # ── Trading signals ───────────────────────────────────────────────────────────
-BUY_THRESHOLD  = 0.65
-SELL_THRESHOLD = 0.40
+BUY_THRESHOLD  = 0.54
+SELL_THRESHOLD = 0.46
 
 # ── Risk management ───────────────────────────────────────────────────────────
 STOP_LOSS_PCT   = 0.03    # 3%

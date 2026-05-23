@@ -38,7 +38,7 @@ HORIZON_ROWS = HORIZON // TFT_SAMPLE_INTERVAL  # 1440 min / 240 min-per-row = 6 
 MODEL_DIR  = os.path.join(ROOT, "models", "saved")
 MODEL_PATH = os.path.join(MODEL_DIR, "meta_xgb.pkl")
 
-AGREE_THRESH = 0.10   # route to gate when |p_tft - p_bilstm| >= this
+AGREE_THRESH = 0.06   # route to gate when |p_tft - p_bilstm| >= this (lowered for more disagreement rows)
 
 # Market context snapshot fed to the correctness gate.
 # Combined from both bilstm_merged (m15/h1) and tft_merged (h4/d1) at inference time.

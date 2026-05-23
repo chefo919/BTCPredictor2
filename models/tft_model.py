@@ -109,12 +109,17 @@ class _StaticGRN(tf.keras.layers.Layer):
         return cfg
 
 
-def build_model(n_dynamic: int, n_static: int = 0) -> tf.keras.Model:
+def build_model(n_dynamic: int, n_static: int = 0,
+                d_model: int = None, dropout_rate: float = None) -> tf.keras.Model:
     """
     Single-input model: input shape = (SEQ_LEN, n_dynamic + n_static).
     When n_static=0 (no static covariates), skips the static GRN path entirely.
+    d_model / dropout_rate override module-level D_MODEL / DROPOUT for diverse ensembles.
     """
     from tensorflow.keras import models
+
+    dm = d_model      if d_model      is not None else D_MODEL
+    dr = dropout_rate if dropout_rate is not None else DROPOUT
 
     n_total = n_dynamic + n_static
     inp = layers.Input(shape=(SEQ_LEN, n_total), name="seq_input")
@@ -122,32 +127,32 @@ def build_model(n_dynamic: int, n_static: int = 0) -> tf.keras.Model:
     dyn_inp = inp[..., :n_dynamic]   # [B, T, n_dynamic]
 
     # ── Dynamic path: VSN -> LSTM -> Attention -> FFN ─────────────────────────
-    vsn         = VSN(n_dynamic, D_MODEL, DROPOUT, name="vsn")
+    vsn         = VSN(n_dynamic, dm, dr, name="vsn")
     x, _weights = vsn(dyn_inp)
 
-    lstm_out = layers.LSTM(D_MODEL, return_sequences=True,
+    lstm_out = layers.LSTM(dm, return_sequences=True,
                             kernel_regularizer=regularizers.l2(1e-4),
                             name="lstm_enc")(x)
     x = layers.LayerNormalization(name="ln_lstm")(lstm_out + x)
 
     attn_out = layers.MultiHeadAttention(
-        num_heads=N_HEADS, key_dim=D_MODEL // N_HEADS,
-        dropout=DROPOUT, name="mhsa"
+        num_heads=N_HEADS, key_dim=max(1, dm // N_HEADS),
+        dropout=dr, name="mhsa"
     )(x, x)
-    attn_out = layers.Dropout(DROPOUT)(attn_out)
+    attn_out = layers.Dropout(dr)(attn_out)
     x = layers.LayerNormalization(name="ln_attn")(attn_out + x)
 
-    ffn = layers.Dense(D_MODEL * 4, activation="relu", name="ffn1")(x)
-    ffn = layers.Dropout(DROPOUT)(ffn)
-    ffn = layers.Dense(D_MODEL, name="ffn2")(ffn)
+    ffn = layers.Dense(dm * 4, activation="relu", name="ffn1")(x)
+    ffn = layers.Dropout(dr)(ffn)
+    ffn = layers.Dense(dm, name="ffn2")(ffn)
     x   = layers.LayerNormalization(name="ln_ffn")(ffn + x)
 
-    pooled = layers.GlobalAveragePooling1D(name="pool")(x)   # [B, D_MODEL]
+    pooled = layers.GlobalAveragePooling1D(name="pool")(x)   # [B, dm]
 
     # ── Static covariate path (skipped when n_static=0) ──────────────────────
     if n_static > 0:
         static_inp = inp[..., n_dynamic:]
-        static_ctx = _StaticGRN(n_static, D_MODEL, DROPOUT, name="static_ctx")(static_inp)
+        static_ctx = _StaticGRN(n_static, dm, dr, name="static_ctx")(static_inp)
         combined   = layers.Add(name="combine")([pooled, static_ctx])
     else:
         combined = pooled
@@ -209,10 +214,23 @@ def _custom_objects():
     return {"GRN": GRN, "VSN": VSN, "_StaticGRN": _StaticGRN}
 
 
+# Diverse per-seed hyperparameters — architectural variation improves ensemble signal coverage
+_TFT_SEED_CFG = [
+    {"d_model": 48,  "dropout": 0.20, "lr": 5e-4},
+    {"d_model": 64,  "dropout": 0.30, "lr": 1e-3},
+    {"d_model": 96,  "dropout": 0.40, "lr": 2e-3},
+]
+
+
 def train(feature_df, dynamic_cols: list, static_cols: list,
-          seed: int = None) -> dict:
+          seed: int = None, seed_cfg: dict = None) -> dict:
     import time
     from sklearn.preprocessing import StandardScaler
+
+    seed_cfg   = seed_cfg or {}
+    _d_model   = seed_cfg.get("d_model",  D_MODEL)
+    _dropout   = seed_cfg.get("dropout",  DROPOUT)
+    _lr_init   = seed_cfg.get("lr",       1e-3)
 
     if seed is not None:
         tf.random.set_seed(seed)
@@ -251,6 +269,12 @@ def train(feature_df, dynamic_cols: list, static_cols: list,
     y_tr_aug = y_tr_aug[perm]
     print(f"  Recency augmentation: {train_end:,} → {len(X_tr_aug):,} rows", flush=True)
 
+    pos = float(y_tr_aug.mean())
+    neg = 1.0 - pos
+    class_weight = {0: round(1.0 / (2.0 * max(neg, 1e-6)), 4),
+                    1: round(1.0 / (2.0 * max(pos, 1e-6)), 4)}
+    print(f"  Class weights: down={class_weight[0]:.3f}  up={class_weight[1]:.3f}", flush=True)
+
     scaler  = StandardScaler()
     X_train = scaler.fit_transform(X_tr_aug).astype(np.float32)
     X_val   = scaler.transform(X[train_end:val_end]).astype(np.float32)
@@ -285,17 +309,29 @@ def train(feature_df, dynamic_cols: list, static_cols: list,
                 print(f"  Resuming {lbl} from checkpoint epoch {start_epoch}", flush=True)
             else:
                 print(f"  Checkpoint shape mismatch — starting fresh.", flush=True)
-                model = build_model(n_dynamic, n_static)
+                model = build_model(n_dynamic, n_static, d_model=_d_model, dropout_rate=_dropout)
                 start_epoch = 0
         except Exception as e:
             print(f"  Checkpoint load failed ({e}) — starting fresh.", flush=True)
-            model = build_model(n_dynamic, n_static)
+            model = build_model(n_dynamic, n_static, d_model=_d_model, dropout_rate=_dropout)
             start_epoch = 0
     else:
-        model = build_model(n_dynamic, n_static)
+        model = build_model(n_dynamic, n_static, d_model=_d_model, dropout_rate=_dropout)
         start_epoch = 0
 
     print(f"  Parameters: {model.count_params():,}", flush=True)
+
+    steps_per_epoch = max(1, len(X_train) // BATCH)
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=_lr_init,
+        decay_steps=N_EPOCHS * steps_per_epoch,
+        alpha=1e-5,
+    )
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(lr_schedule, clipnorm=1.0),
+        loss="binary_crossentropy",
+        metrics=["accuracy"],
+    )
 
     BAR = 36
 
@@ -325,13 +361,12 @@ def train(feature_df, dynamic_cols: list, static_cols: list,
     callbacks = [
         _ProgressCB(),
         tf.keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True),
-        tf.keras.callbacks.ReduceLROnPlateau(patience=4, factor=0.3, min_lr=1e-6, verbose=0),
         _CheckpointCB(_ckpt_dir, "tft", every_n=5),
     ]
 
     history = model.fit(train_ds, validation_data=val_ds,
                         epochs=N_EPOCHS, initial_epoch=start_epoch,
-                        callbacks=callbacks, verbose=0)
+                        callbacks=callbacks, class_weight=class_weight, verbose=0)
 
     val_acc  = max(history.history.get("val_accuracy", [0.5]))
     _, test_acc = model.evaluate(test_ds, verbose=0)
@@ -351,13 +386,17 @@ def train(feature_df, dynamic_cols: list, static_cols: list,
 
 
 def train_ensemble(feature_df, dynamic_cols: list, static_cols: list) -> list:
-    """Train N_ENSEMBLE seeds and return list of results. Predictions are averaged at inference."""
+    """Train N_ENSEMBLE seeds with diverse hyperparameters. Predictions averaged at inference."""
     results = []
     for s in range(N_ENSEMBLE):
+        cfg = _TFT_SEED_CFG[s] if s < len(_TFT_SEED_CFG) else {}
         print(f"\n{'='*50}", flush=True)
-        print(f"TFT ENSEMBLE — seed {s+1}/{N_ENSEMBLE}", flush=True)
+        print(f"TFT ENSEMBLE — seed {s+1}/{N_ENSEMBLE}  "
+              f"d_model={cfg.get('d_model', D_MODEL)}  "
+              f"dropout={cfg.get('dropout', DROPOUT)}  "
+              f"lr={cfg.get('lr', 1e-3)}", flush=True)
         print(f"{'='*50}", flush=True)
-        r = train(feature_df, dynamic_cols, static_cols, seed=s)
+        r = train(feature_df, dynamic_cols, static_cols, seed=s, seed_cfg=cfg)
         results.append(r)
         print(f"  Seed {s}: val={r['val_acc']:.4f}  test={r['test_acc']:.4f}", flush=True)
     avg_val  = float(np.mean([r["val_acc"]  for r in results]))

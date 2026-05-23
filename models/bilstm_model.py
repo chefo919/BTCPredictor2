@@ -2,7 +2,7 @@
 Attention-Customized Bidirectional LSTM (ACB) — short-term momentum model.
 
 Inputs:  15m, 1H features (24 cols) — momentum signals sampled at 15-minute intervals
-Context: 24 hours at 15min resolution (SEQ_LEN=96 rows from bilstm_merged)
+Context: 48 hours at 15min resolution (SEQ_LEN=192 rows from bilstm_merged)
 Target:  1-day price direction (HORIZON=1440)
 
 Input data comes pre-sampled at 15-minute boundaries from {YYYY}_bilstm_merged.csv,
@@ -24,7 +24,7 @@ sys.path.insert(0, ROOT)
 from config import (SEQ_LEN_BILSTM as SEQ_LEN, HORIZON_BILSTM as HORIZON,
                     N_EPOCHS_BILSTM as N_EPOCHS, BATCH_BILSTM as BATCH,
                     STRIDE_BILSTM as STRIDE, DROPOUT_BILSTM as DROPOUT,
-                    N_ENSEMBLE, BILSTM_SAMPLE_INTERVAL)
+                    N_ENSEMBLE, BILSTM_SAMPLE_INTERVAL, LSTM_UNITS_BILSTM)
 
 HORIZON_ROWS = HORIZON // BILSTM_SAMPLE_INTERVAL  # 1440 min / 15 min-per-row = 96 rows (1 day)
 
@@ -43,6 +43,13 @@ def _ensemble_ready():    return all(os.path.exists(_seed_model_path(s)) for s i
 #                             m15_obv_zscore(8), m15_vol_ratio(9), m15_body_ratio(10), m15_adx(11)
 _MACD_IDX     = 1   # m15_macd_diff_pct — 15m price momentum proxy
 _VOL_IDX      = 9   # m15_vol_ratio     — 15m volume spike indicator
+
+# Diverse per-seed hyperparameters — architectural variation improves ensemble signal coverage
+_BILSTM_SEED_CFG = [
+    {"units": 48,  "dropout": 0.20, "lr": 5e-4},
+    {"units": 64,  "dropout": 0.25, "lr": 1e-3},
+    {"units": 96,  "dropout": 0.30, "lr": 2e-3},
+]
 
 
 def _fmt(seconds: float) -> str:
@@ -85,6 +92,7 @@ class _PVAttention(tf.keras.layers.Layer):
         pv_signal    = price_signal * vol_signal                              # [B, T, 1]
 
         # Combined: LSTM score amplified by price-volume signal
+        pv_signal     = tf.cast(pv_signal, attn_lstm.dtype)
         attn_combined = attn_lstm + pv_signal          # [B, T, 1]
         return tf.nn.softmax(attn_combined, axis=1)    # [B, T, 1]
 
@@ -130,22 +138,25 @@ def _custom_objects():
     return {"_SumPool": _SumPool, "_PVAttention": _PVAttention}
 
 
-def build_model(n_features: int) -> tf.keras.Model:
+def build_model(n_features: int, units: int = None,
+                dropout_rate: float = None) -> tf.keras.Model:
+    units        = units        if units        is not None else LSTM_UNITS_BILSTM
+    dropout_rate = dropout_rate if dropout_rate is not None else DROPOUT
     L2  = 1e-4
     inp = layers.Input(shape=(SEQ_LEN, n_features), name="bilstm_input")
 
     x = layers.Bidirectional(
-        layers.LSTM(32, return_sequences=True,
+        layers.LSTM(units, return_sequences=True,
                     kernel_regularizer=regularizers.l2(L2)),
         name="bi_lstm"
-    )(inp)   # [B, T, 64]
+    )(inp)   # [B, T, units*2]
 
     # Price-volume customized attention
     attn_w = _PVAttention(_MACD_IDX, _VOL_IDX, name="pv_attn")(x, inp)  # [B, T, 1]
     x      = layers.Multiply(name="attn_apply")([x, attn_w])
-    x      = _SumPool(name="attn_pool")(x)   # [B, 64]
+    x      = _SumPool(name="attn_pool")(x)   # [B, units*2]
 
-    x   = layers.Dropout(DROPOUT, name="dropout")(x)
+    x   = layers.Dropout(dropout_rate, name="dropout")(x)
     out = layers.Dense(1, activation="sigmoid",
                         kernel_regularizer=regularizers.l2(1e-3),
                         name="output")(x)
@@ -156,9 +167,15 @@ def build_model(n_features: int) -> tf.keras.Model:
     return model
 
 
-def train(feature_df, feature_cols: list, seed: int = None) -> dict:
+def train(feature_df, feature_cols: list, seed: int = None,
+          seed_cfg: dict = None) -> dict:
     import time
     from sklearn.preprocessing import StandardScaler
+
+    seed_cfg     = seed_cfg or {}
+    _units       = seed_cfg.get("units",   LSTM_UNITS_BILSTM)
+    _dropout     = seed_cfg.get("dropout", DROPOUT)
+    _lr_init     = seed_cfg.get("lr",      1e-3)
 
     if seed is not None:
         import tensorflow as _tf
@@ -192,6 +209,12 @@ def train(feature_df, feature_cols: list, seed: int = None) -> dict:
     y_tr_aug = y_tr_aug[perm]
     print(f"  Recency augmentation: {train_end:,} → {len(X_tr_aug):,} rows", flush=True)
 
+    pos = float(y_tr_aug.mean())
+    neg = 1.0 - pos
+    class_weight = {0: round(1.0 / (2.0 * max(neg, 1e-6)), 4),
+                    1: round(1.0 / (2.0 * max(pos, 1e-6)), 4)}
+    print(f"  Class weights: down={class_weight[0]:.3f}  up={class_weight[1]:.3f}", flush=True)
+
     scaler  = StandardScaler()
     X_train = scaler.fit_transform(X_tr_aug).astype(np.float32)
     X_val   = scaler.transform(X[train_end:val_end]).astype(np.float32)
@@ -223,17 +246,29 @@ def train(feature_df, feature_cols: list, seed: int = None) -> dict:
                 print(f"  Resuming BiLSTM from checkpoint epoch {start_epoch}", flush=True)
             else:
                 print(f"  Checkpoint shape mismatch — starting fresh.", flush=True)
-                model = build_model(n_features)
+                model = build_model(n_features, units=_units, dropout_rate=_dropout)
                 start_epoch = 0
         except Exception as e:
             print(f"  Checkpoint load failed ({e}) — starting fresh.", flush=True)
-            model = build_model(n_features)
+            model = build_model(n_features, units=_units, dropout_rate=_dropout)
             start_epoch = 0
     else:
-        model = build_model(n_features)
+        model = build_model(n_features, units=_units, dropout_rate=_dropout)
         start_epoch = 0
 
     print(f"  BiLSTM parameters: {model.count_params():,}", flush=True)
+
+    steps_per_epoch = max(1, len(X_train) // BATCH)
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=_lr_init,
+        decay_steps=N_EPOCHS * steps_per_epoch,
+        alpha=1e-5,
+    )
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(lr_schedule, clipnorm=1.0),
+        loss="binary_crossentropy",
+        metrics=["accuracy"],
+    )
 
     BAR = 36
 
@@ -263,13 +298,12 @@ def train(feature_df, feature_cols: list, seed: int = None) -> dict:
     callbacks = [
         _ProgressCB(),
         tf.keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True),
-        tf.keras.callbacks.ReduceLROnPlateau(patience=4, factor=0.3, min_lr=1e-6, verbose=0),
         _CheckpointCB(_ckpt_dir, "bilstm", every_n=5),
     ]
 
     history = model.fit(train_ds, validation_data=val_ds,
                         epochs=N_EPOCHS, initial_epoch=start_epoch,
-                        callbacks=callbacks, verbose=0)
+                        callbacks=callbacks, class_weight=class_weight, verbose=0)
 
     val_acc  = max(history.history.get("val_accuracy", [0.5]))
     _, test_acc = model.evaluate(test_ds, verbose=0)
@@ -286,13 +320,17 @@ def train(feature_df, feature_cols: list, seed: int = None) -> dict:
 
 
 def train_ensemble(feature_df, feature_cols: list) -> list:
-    """Train N_ENSEMBLE seeds and return list of results."""
+    """Train N_ENSEMBLE seeds with diverse hyperparameters and return list of results."""
     results = []
     for s in range(N_ENSEMBLE):
+        cfg = _BILSTM_SEED_CFG[s] if s < len(_BILSTM_SEED_CFG) else {}
         print(f"\n{'='*50}", flush=True)
-        print(f"BiLSTM ENSEMBLE — seed {s+1}/{N_ENSEMBLE}", flush=True)
+        print(f"BiLSTM ENSEMBLE — seed {s+1}/{N_ENSEMBLE}  "
+              f"units={cfg.get('units', LSTM_UNITS_BILSTM)}  "
+              f"dropout={cfg.get('dropout', DROPOUT)}  "
+              f"lr={cfg.get('lr', 1e-3)}", flush=True)
         print(f"{'='*50}", flush=True)
-        r = train(feature_df, feature_cols, seed=s)
+        r = train(feature_df, feature_cols, seed=s, seed_cfg=cfg)
         results.append(r)
         print(f"  Seed {s}: val={r['val_acc']:.4f}  test={r['test_acc']:.4f}", flush=True)
     avg_val  = float(np.mean([r["val_acc"]  for r in results]))
@@ -351,4 +389,4 @@ def predict_proba_batch(X_all: np.ndarray, feature_cols: list = None,
 
 
 def is_trained() -> bool:
-    return os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH)
+    return _ensemble_ready() or (os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH))

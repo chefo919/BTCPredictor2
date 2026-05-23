@@ -105,16 +105,16 @@ bt_state = _BtState()
 # ── Training cutoff loader ─────────────────────────────────────────────────────
 
 def _load_training_cutoff() -> str | None:
-    """Return the training data cutoff as 'YYYY-MM-DD', or None if not found."""
+    """Return the training data cutoff as 'YYYY-MM-DD'. Falls back to config if file missing."""
     path = os.path.join(MODELS_DIR, "training_cutoff.txt")
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        raw = f.read().strip()
-    try:
-        return str(pd.Timestamp(raw).date())
-    except Exception:
-        return None
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return str(pd.Timestamp(f.read().strip()).date())
+        except Exception:
+            pass
+    from config import TRAINING_CUTOFF_DATE
+    return str(pd.Timestamp(TRAINING_CUTOFF_DATE).date())
 
 
 # ── Backtest helpers ───────────────────────────────────────────────────────────
@@ -219,53 +219,37 @@ def _run_backtest(start_date_str: str):
 
         print(f"[Backtest] {n:,} rows to process", flush=True)
 
-        # Load models
+        # Load models — ensemble handled internally by model modules
         bt_state.phase    = "models"
         bt_state.progress = 5
-        from models.tft_model    import GRN as _GRN, VSN as _VSN
-        from models.bilstm_model import _SumPool
-        from models import meta_model as _meta
-        tft_m    = tf.keras.models.load_model(os.path.join(MODELS_DIR, "tft.keras"),
-                                               custom_objects={"GRN": _GRN, "VSN": _VSN})
-        tft_s    = joblib.load(os.path.join(MODELS_DIR, "tft_scaler.pkl"))
-        bilstm_m = tf.keras.models.load_model(os.path.join(MODELS_DIR, "bilstm.keras"),
-                                               custom_objects={"_SumPool": _SumPool})
-        bilstm_s = joblib.load(os.path.join(MODELS_DIR, "bilstm_scaler.pkl"))
-        # meta model is loaded internally by _meta.predict_proba_batch
+        from models import tft_model as _tft_mod, bilstm_model as _bi_mod, meta_model as _meta
 
         bt_state.progress = 10
         bt_state.phase    = "inference"
+        batch = 512
 
-        batch     = 512
-        SEQ_TFT   = tft_m.input_shape[1]
-        SEQ_BILSTM_val = bilstm_m.input_shape[1]
-        n_bilstm  = len(df_bilstm) - first_idx_bilstm
+        # n_static for TFT (0 for current models — no static covariates)
+        _ns_val  = 0
+        _ns_path = os.path.join(MODELS_DIR, "tft_n_static.txt")
+        if os.path.exists(_ns_path):
+            with open(_ns_path) as _f:
+                _ns_val = int(_f.read().strip() or "0")
 
-        # TFT pass — 4h-sampled tft_merged
-        X_tft_all = df_tft[TFT_DYN_FEATURES].values.astype(np.float32)
-        tft_sc    = tft_s.transform(X_tft_all).astype(np.float32)
-        tft_probs = np.full(n, 0.5, dtype=np.float32)
-        n_batches = (n + batch - 1) // batch
-        for b in range(n_batches):
-            bs  = b * batch; be = min(bs + batch, n)
-            idx = np.arange(first_idx_tft + bs, first_idx_tft + be)
-            win = idx[:, None] + np.arange(-SEQ_TFT + 1, 1)[None, :]
-            tft_probs[bs:be] = tft_m.predict(tft_sc[win], verbose=0, batch_size=batch).flatten()
-            bt_state.progress = 10 + int((b + 1) / n_batches * 35)
-        del tft_sc
+        # TFT pass — 3-seed ensemble averaged internally
+        print("[Backtest] TFT ensemble inference...", flush=True)
+        X_dyn    = df_tft[TFT_DYN_FEATURES].values.astype(np.float32)
+        X_sta    = np.zeros((len(df_tft), _ns_val), dtype=np.float32)
+        _tft_all = _tft_mod.predict_proba_batch(X_dyn, X_sta, batch_size=batch)
+        tft_probs = _tft_all[first_idx_tft:first_idx_tft + n].astype(np.float32)
+        bt_state.progress = 45
 
-        # BiLSTM pass — 15min-sampled bilstm_merged
-        X_bi_all     = df_bilstm[BILSTM_FEATURES].values.astype(np.float32)
-        bilstm_sc    = bilstm_s.transform(X_bi_all).astype(np.float32)
-        bilstm_probs_raw = np.full(n_bilstm, 0.5, dtype=np.float32)
-        n_batches_bi = (n_bilstm + batch - 1) // batch
-        for b in range(n_batches_bi):
-            bs  = b * batch; be = min(bs + batch, n_bilstm)
-            idx = np.arange(first_idx_bilstm + bs, first_idx_bilstm + be)
-            win = np.clip(idx[:, None] + np.arange(-SEQ_BILSTM_val + 1, 1)[None, :], 0, len(bilstm_sc)-1)
-            bilstm_probs_raw[bs:be] = bilstm_m.predict(bilstm_sc[win], verbose=0, batch_size=batch).flatten()
-            bt_state.progress = 45 + int((b + 1) / n_batches_bi * 35)
-        del bilstm_sc
+        # BiLSTM pass — 3-seed ensemble averaged internally
+        print("[Backtest] BiLSTM ensemble inference...", flush=True)
+        X_bi_all         = df_bilstm[BILSTM_FEATURES].values.astype(np.float32)
+        _bi_all          = _bi_mod.predict_proba_batch(X_bi_all, batch_size=batch)
+        n_bilstm         = len(df_bilstm) - first_idx_bilstm
+        bilstm_probs_raw = _bi_all[first_idx_bilstm:first_idx_bilstm + n_bilstm].astype(np.float32)
+        bt_state.progress = 80
 
         # Align bilstm probs onto tft timestamps via nearest join
         tft_times_active    = pd.DatetimeIndex(df_tft["time"].values[first_idx_tft:])

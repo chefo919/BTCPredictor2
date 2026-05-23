@@ -5,13 +5,17 @@ Change a value once — it propagates everywhere automatically.
 """
 
 # ── Sequence lengths (lookback windows) ──────────────────────────────────────
-SEQ_LEN_TFT    = 168    # 168 x 1h steps = 7 days macro context (hourly downsampled from 1m)
-SEQ_LEN_BILSTM = 240    # 240 minute steps = 4 hours short-term momentum
+SEQ_LEN_TFT    = 180    # 180 × 4h steps = 30 days macro context (4h-sampled tft_merged)
+SEQ_LEN_BILSTM = 96     # 96 × 15min steps = 24h short-term momentum (15min-sampled bilstm_merged)
 
 # ── Prediction horizons ───────────────────────────────────────────────────────
-HORIZON_TFT    = 60     # 1 hour — macro model predicts 1h direction
-HORIZON_BILSTM = 60     # 1 hour — ACB model predicts 1h direction
-HORIZON_META   = 60     # 1 hour — meta actionable signal
+HORIZON_TFT    = 1440   # 1 day — macro model predicts 1-day direction
+HORIZON_BILSTM = 1440   # 1 day — ACB model predicts 1-day direction
+HORIZON_META   = 1440   # 1 day — meta actionable signal
+
+# ── Sampling intervals for pre-sampled merged CSVs ───────────────────────────
+BILSTM_SAMPLE_INTERVAL = 15    # minutes between rows in bilstm_merged
+TFT_SAMPLE_INTERVAL    = 240   # minutes between rows in tft_merged (4 hours)
 
 # ── TFT architecture ──────────────────────────────────────────────────────────
 D_MODEL        = 64    # was 32 — 4x more parameters, same memory (attention is seq×seq not d_model)
@@ -19,14 +23,14 @@ N_ENSEMBLE     = 3     # seeds per model — predictions averaged for XGBoost an
 N_HEADS        = 4
 DROPOUT_TFT    = 0.3
 N_EPOCHS_TFT   = 100
-BATCH_TFT      = 32     # CPU-safe: attention [32,4,480,480] = ~118 MB. Colab overrides to 512.
-STRIDE_TFT     = 1      # hourly-downsampled data — stride 1 = one sequence per hour
+BATCH_TFT      = 32     # CPU-safe. Colab overrides to 512.
+STRIDE_TFT     = 1      # 4h-sampled data — stride 1 = one sequence per 4h step
 
 # ── BiLSTM architecture ───────────────────────────────────────────────────────
 DROPOUT_BILSTM  = 0.5
 N_EPOCHS_BILSTM = 100
-BATCH_BILSTM    = 16    # CPU-safe for SEQ_LEN=720. Colab overrides to 512.
-STRIDE_BILSTM   = 60    # one prediction horizon per training step
+BATCH_BILSTM    = 16    # CPU-safe. Colab overrides to 512.
+STRIDE_BILSTM   = 4     # 1 sample per hour = every 4 steps in 15min-sampled data
 
 # ── Training ──────────────────────────────────────────────────────────────────
 TRAINING_CUTOFF_DATE = "2026-04-15"
@@ -38,8 +42,8 @@ SELL_THRESHOLD = 0.40
 # ── Risk management ───────────────────────────────────────────────────────────
 STOP_LOSS_PCT   = 0.03    # 3%
 TAKE_PROFIT_PCT = 0.06    # 6%
-MIN_HOLD_MIN    = 60      # minimum hold = one full prediction horizon (1 hour)
-MAX_HOLD_MIN    = 720     # 12 hours — let signal drive the exit, not the clock
+MIN_HOLD_MIN    = 1440    # minimum hold = one full prediction horizon (1 day)
+MAX_HOLD_MIN    = 4320    # 3 days — let signal drive the exit, not the clock
 CHOP_FILTER_PCT = 0.005   # skip entries when 1H range < 0.5%
 
 # ── Portfolio ─────────────────────────────────────────────────────────────────

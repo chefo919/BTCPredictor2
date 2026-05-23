@@ -15,24 +15,50 @@ import json
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from features.engineer import FEATURE_COLS, MERGED
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT_DIR)
+from features.engineer import BILSTM_FEAT_COLS, TFT_FEAT_COLS
 
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from config import HORIZON_META as HORIZON, TRAINING_CUTOFF_DATE as CUTOFF_DATE
 
+ALL_FEATURES    = TFT_FEAT_COLS + BILSTM_FEAT_COLS   # 48 features
 SAMPLE_ROWS     = 200_000
 LABEL_THRESHOLD = 0.001   # kept for reference, not used in label construction
-OUTPUT_PATH      = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "models", "saved", "selected_features.json")
+OUTPUT_PATH      = os.path.join(ROOT_DIR, "models", "saved", "selected_features.json")
+YEARLY_DIR       = os.path.join(ROOT_DIR, "data", "yearly_merged")
+
+
+def _load_yearly(pattern: str) -> pd.DataFrame:
+    now_year = pd.Timestamp.now(tz="UTC").year
+    dfs = []
+    for y in range(now_year - 6, now_year + 1):
+        path = os.path.join(YEARLY_DIR, f"{y}_{pattern}.csv")
+        if os.path.exists(path):
+            df = pd.read_csv(path, parse_dates=["time"])
+            if df["time"].dt.tz is None:
+                df["time"] = pd.to_datetime(df["time"], utc=True)
+            dfs.append(df)
+    if not dfs:
+        raise RuntimeError(f"No {pattern} files found in {YEARLY_DIR}. Run features/engineer.py.")
+    return (pd.concat(dfs)
+              .sort_values("time")
+              .drop_duplicates("time")
+              .reset_index(drop=True))
 
 
 def run():
-    print(f"Loading {MERGED}...", flush=True)
-    df = pd.read_csv(MERGED, parse_dates=["time"])
-    if df["time"].dt.tz is None:
-        df["time"] = pd.to_datetime(df["time"], utc=True)
+    print("Loading tft_merged and bilstm_merged...", flush=True)
+    df_tft    = _load_yearly("tft_merged")
+    df_bilstm = _load_yearly("bilstm_merged")
+
+    # Align bilstm features onto tft timestamps (4h resolution) via nearest join
+    df = pd.merge_asof(
+        df_tft.sort_values("time"),
+        df_bilstm[["time"] + BILSTM_FEAT_COLS].sort_values("time"),
+        on="time", direction="nearest", tolerance=pd.Timedelta("3h"),
+    )
 
     cutoff_ts = pd.Timestamp(CUTOFF_DATE, tz="UTC")
     before    = len(df)
@@ -42,21 +68,21 @@ def run():
     # Build target matching train.py exactly — all rows, simple up/down
     df["target"] = (df["close"].shift(-HORIZON) > df["close"]).astype(int)
     df           = df.dropna(subset=["target", "close"])
-    df           = df.dropna(subset=FEATURE_COLS)
+    df           = df.dropna(subset=ALL_FEATURES)
     print(f"Rows after dropna: {len(df):,}  (label balance: {df['target'].mean():.3f})", flush=True)
 
     # Use recent tail — more representative of current market regime
     sample = df.tail(SAMPLE_ROWS).copy()
-    X = sample[FEATURE_COLS].values.astype(np.float32)
+    X = sample[ALL_FEATURES].values.astype(np.float32)
     y = sample["target"].values.astype(int)
-    print(f"Running feature selection on {len(sample):,} rows × {len(FEATURE_COLS)} features...", flush=True)
+    print(f"Running feature selection on {len(sample):,} rows × {len(ALL_FEATURES)} features...", flush=True)
 
     try:
         from boostARoota import BoostARoota
         selector = BoostARoota(metric="logloss", max_rounds=10, delta=0.1, silent=False)
         selector.fit(X, y)
         kept_mask     = selector.keep_vars_
-        kept_features = [f for f, k in zip(FEATURE_COLS, kept_mask) if k]
+        kept_features = [f for f, k in zip(ALL_FEATURES, kept_mask) if k]
         method        = "BoostARoota"
     except ImportError:
         print("boostARoota not installed — falling back to XGBoost importance (top 75%)", flush=True)
@@ -67,13 +93,13 @@ def run():
         model.fit(X, y)
         importances   = model.feature_importances_
         threshold     = np.percentile(importances[importances > 0], 25)
-        kept_features = [f for f, imp in zip(FEATURE_COLS, importances)
+        kept_features = [f for f, imp in zip(ALL_FEATURES, importances)
                          if imp >= threshold]
         method        = f"XGBoost importance ≥ {threshold:.6f} (top 75%)"
 
-    print(f"\n{method}: selected {len(kept_features)} / {len(FEATURE_COLS)} features")
+    print(f"\n{method}: selected {len(kept_features)} / {len(ALL_FEATURES)} features")
     print("-" * 50)
-    dropped = [f for f in FEATURE_COLS if f not in kept_features]
+    dropped = [f for f in ALL_FEATURES if f not in kept_features]
     print(f"KEPT ({len(kept_features)}):")
     for f in kept_features:
         print(f"  {f}")
@@ -86,7 +112,7 @@ def run():
         json.dump({
             "selected":       kept_features,
             "dropped":        dropped,
-            "total_original": len(FEATURE_COLS),
+            "total_original": len(ALL_FEATURES),
             "total_selected": len(kept_features),
             "method":         method,
             "sample_rows":    len(sample),

@@ -17,23 +17,19 @@ logging.getLogger("tensorflow").setLevel(logging.ERROR)
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from data_manager import update_data
-from features.engineer import FEATURE_COLS, get_feature_groups, update_features
+from features.engineer import (BILSTM_FEAT_COLS, TFT_FEAT_COLS,
+                                get_feature_groups, update_features)
 from models import tft_model, bilstm_model, meta_model
-from config import BUY_THRESHOLD, SELL_THRESHOLD
+from config import BUY_THRESHOLD, SELL_THRESHOLD, SEQ_LEN_TFT, SEQ_LEN_BILSTM
 
 ROOT       = os.path.dirname(os.path.dirname(__file__))
-YEARLY_DIR = os.path.join(ROOT, "data", "yearly")
+YEARLY_DIR = os.path.join(ROOT, "data", "yearly_merged")
 
 _groups          = get_feature_groups()
-BILSTM_FEATURES  = _groups["bilstm"]
-TFT_DYN_FEATURES = _groups["tft_dynamic"]
-TFT_STA_FEATURES = _groups["tft_static"]
-ALL_FEATURES     = BILSTM_FEATURES + TFT_DYN_FEATURES + TFT_STA_FEATURES
-
-# TFT uses hourly-downsampled sequences: need SEQ_LEN * DOWNSAMPLE minutes of history
-SEQ_LEN    = tft_model.SEQ_LEN
-DOWNSAMPLE = tft_model.DOWNSAMPLE
-TFT_TAIL   = SEQ_LEN * DOWNSAMPLE + 200   # minutes needed for 240 hourly rows
+BILSTM_FEATURES  = _groups["bilstm"]       # m15_* + h1_*
+TFT_DYN_FEATURES = _groups["tft_dynamic"]  # h4_* + d1_*
+TFT_STA_FEATURES = _groups["tft_static"]   # []
+ALL_GATE_FEATURES = TFT_DYN_FEATURES + BILSTM_FEATURES
 
 
 def _load_tail(path: str, n: int = 200) -> pd.DataFrame:
@@ -53,18 +49,18 @@ def _load_tail(path: str, n: int = 200) -> pd.DataFrame:
     return df
 
 
-def _load_yearly_tail(n: int) -> pd.DataFrame:
-    """Load the last n rows from yearly files (current + previous year for seq warm-up)."""
+def _load_bilstm_tail(n: int) -> pd.DataFrame:
+    """Load last n rows from bilstm_merged (15min-sampled, m15_* + h1_* features)."""
     if not os.path.exists(YEARLY_DIR):
-        raise RuntimeError("data/yearly/ not found. Run features/engineer.py first.")
+        raise RuntimeError("data/yearly_merged/ not found. Run features/engineer.py first.")
     now_year = pd.Timestamp.now(tz="UTC").year
     dfs = []
     for y in [now_year - 1, now_year]:
-        path = os.path.join(YEARLY_DIR, f"{y}_merged.csv")
+        path = os.path.join(YEARLY_DIR, f"{y}_bilstm_merged.csv")
         if os.path.exists(path):
             dfs.append(_load_tail(path, n=n))
     if not dfs:
-        raise RuntimeError("No yearly merged files found for current or previous year.")
+        raise RuntimeError("No bilstm_merged files found for current or previous year.")
     df = (pd.concat(dfs)
             .sort_values("time")
             .drop_duplicates("time")
@@ -75,12 +71,35 @@ def _load_yearly_tail(n: int) -> pd.DataFrame:
     return df
 
 
-def _market_context(row: pd.Series) -> list:
+def _load_tft_tail(n: int) -> pd.DataFrame:
+    """Load last n rows from tft_merged (4h-sampled, h4_* + d1_* features)."""
+    if not os.path.exists(YEARLY_DIR):
+        raise RuntimeError("data/yearly_merged/ not found. Run features/engineer.py first.")
+    now_year = pd.Timestamp.now(tz="UTC").year
+    dfs = []
+    for y in [now_year - 1, now_year]:
+        path = os.path.join(YEARLY_DIR, f"{y}_tft_merged.csv")
+        if os.path.exists(path):
+            dfs.append(_load_tail(path, n=n))
+    if not dfs:
+        raise RuntimeError("No tft_merged files found for current or previous year.")
+    df = (pd.concat(dfs)
+            .sort_values("time")
+            .drop_duplicates("time")
+            .tail(n)
+            .reset_index(drop=True))
+    if df["time"].dt.tz is None:
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+    return df
+
+
+def _market_context(tft_row: pd.Series, bilstm_row: pd.Series) -> list:
     items = []
-    for tf, rsi_col, macd_col in [
-        ("1H",  "h1_rsi",  "h1_macd_diff_pct"),
-        ("4H",  "h4_rsi",  "h4_macd_diff_pct"),
-        ("1D",  "d1_rsi",  "d1_macd_diff_pct"),
+    for tf, rsi_col, macd_col, row in [
+        ("15m", "m15_rsi", "m15_macd_diff_pct", bilstm_row),
+        ("1H",  "h1_rsi",  "h1_macd_diff_pct",  bilstm_row),
+        ("4H",  "h4_rsi",  "h4_macd_diff_pct",  tft_row),
+        ("1D",  "d1_rsi",  "d1_macd_diff_pct",  tft_row),
     ]:
         if rsi_col not in row.index:
             continue
@@ -97,28 +116,37 @@ def generate_signal(fetch: bool = True) -> dict:
         update_data()
         update_features()
 
-    df = _load_yearly_tail(n=TFT_TAIL)
-    df = df.dropna(subset=ALL_FEATURES)
+    # Load pre-sampled model inputs
+    df_tft    = _load_tft_tail(n=SEQ_LEN_TFT + 10)
+    df_bilstm = _load_bilstm_tail(n=SEQ_LEN_BILSTM + 10)
 
-    if len(df) < SEQ_LEN:
-        raise RuntimeError(f"Not enough clean rows: {len(df)} < {SEQ_LEN}")
+    df_tft    = df_tft.dropna(subset=TFT_DYN_FEATURES)
+    df_bilstm = df_bilstm.dropna(subset=BILSTM_FEATURES)
 
-    now           = datetime.now(tz=timezone.utc)
-    last_row      = df.iloc[-1]
-    last_candle   = last_row["time"]
-    current_price = float(last_row["close"]) if "close" in df.columns else float("nan")
-    lag_minutes   = (now - last_candle).total_seconds() / 60
+    if len(df_tft) < SEQ_LEN_TFT:
+        raise RuntimeError(f"Not enough TFT rows: {len(df_tft)} < {SEQ_LEN_TFT}")
+    if len(df_bilstm) < SEQ_LEN_BILSTM:
+        raise RuntimeError(f"Not enough BiLSTM rows: {len(df_bilstm)} < {SEQ_LEN_BILSTM}")
 
-    X_dyn    = df[TFT_DYN_FEATURES].values
-    X_sta    = df[TFT_STA_FEATURES].values
-    X_bi     = df[BILSTM_FEATURES].values
+    now             = datetime.now(tz=timezone.utc)
+    last_tft_row    = df_tft.iloc[-1]
+    last_bilstm_row = df_bilstm.iloc[-1]
+    last_candle     = last_tft_row["time"]
+    current_price   = float(last_tft_row["close"]) if "close" in df_tft.columns else float("nan")
+    lag_minutes     = (now - last_candle).total_seconds() / 60
+
+    X_dyn = df_tft[TFT_DYN_FEATURES].values
+    X_sta = df_tft[TFT_STA_FEATURES].values if TFT_STA_FEATURES else np.zeros((len(df_tft), 0))
+    X_bi  = df_bilstm[BILSTM_FEATURES].values
 
     p_tft    = tft_model.predict_proba(X_dyn, X_sta)
     p_bilstm = bilstm_model.predict_proba(X_bi)
 
     if meta_model.is_trained():
-        final_score = meta_model.predict_proba(p_tft, p_bilstm, last_row,
-                                                TFT_DYN_FEATURES + TFT_STA_FEATURES)
+        # Combine last TFT and BiLSTM rows into a single gate snapshot
+        gate_snapshot = pd.concat([last_tft_row, last_bilstm_row])
+        final_score   = meta_model.predict_proba(p_tft, p_bilstm, gate_snapshot,
+                                                  ALL_GATE_FEATURES)
     else:
         final_score = (p_tft + p_bilstm) / 2.0
 
@@ -142,7 +170,7 @@ def generate_signal(fetch: bool = True) -> dict:
         "final_score": final_score,
         "signal":      signal,
         "confidence":  conf,
-        "context":     _market_context(last_row),
+        "context":     _market_context(last_tft_row, last_bilstm_row),
     }
 
 

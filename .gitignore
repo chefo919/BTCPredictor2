@@ -1,5 +1,7 @@
 # ── Data (all CSVs are large — never commit) ─────────────────────────────────
 data/
+!data/yearly_merged/
+!data/yearly_merged/*.csv
 
 # ── Trained model weights (binary, too large for git) ────────────────────────
 models/saved/*.keras

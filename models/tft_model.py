@@ -1,14 +1,10 @@
 """
 Adaptive Temporal Fusion Transformer — macro direction model (TFT-ACB-XML).
 
-Predicts 1-hour price direction using 24 hours of 1-min candle context.
-Features are split into two groups:
-  - Dynamic (time-varying): h1/h4/d1 indicators — fed through VSN + LSTM + Attention
-  - Static (slow-moving):   w1/mo1 indicators   — barely change in 24h; fed as context
-
-The static covariates are concatenated as the last feature block and processed
-via a separate GRN at the final timestep, then added to the pooled dynamic output.
-This prevents attention dilution and cleanly isolates genuine macro regime signals.
+Predicts 1-day price direction using 30 days of 4h-sampled context.
+Features: h4/d1 indicators (24 features, all dynamic — no static covariates).
+Input data comes pre-sampled at 4-hour boundaries from {YYYY}_tft_merged.csv,
+so no internal downsampling is needed.
 
 Reference: arXiv 2602.12380 — TFT-ACB-XML (Din & Khan, 2026)
 """
@@ -22,12 +18,6 @@ from config import (SEQ_LEN_TFT as SEQ_LEN, HORIZON_TFT as HORIZON,
                     N_EPOCHS_TFT as N_EPOCHS, BATCH_TFT as BATCH,
                     STRIDE_TFT as STRIDE, D_MODEL, N_HEADS, DROPOUT_TFT as DROPOUT,
                     N_ENSEMBLE)
-
-# TFT trains and infers on hourly-downsampled data.
-# The input DataFrame is always at 1-minute resolution; we take every DOWNSAMPLE-th row
-# so each sequence step represents one hour of real time.
-# SEQ_LEN=240 × DOWNSAMPLE=60 = 14400 minutes (10 days) of macro context.
-DOWNSAMPLE = 60   # sample every 60 minutes (hourly): 168 steps x 1h = 7 days context
 
 MODEL_DIR        = os.path.join(ROOT, "models", "saved")
 MODEL_PATH       = os.path.join(MODEL_DIR, "tft.keras")
@@ -106,7 +96,7 @@ class _StaticGRN(tf.keras.layers.Layer):
         self.grn      = GRN(d_model, dropout, name="static_grn")
 
     def call(self, x, training=False):
-        # x: [B, T, n_static] — take last timestep (values are ~constant over 24h)
+        # x: [B, T, n_static] — take last timestep (values are ~constant over window)
         static_last = x[:, -1, :]           # [B, n_static]
         return self.grn(static_last, training=training)   # [B, D_MODEL]
 
@@ -237,11 +227,8 @@ def train(feature_df, dynamic_cols: list, static_cols: list,
     df["target"] = (df["close"].shift(-HORIZON) > df["close"]).astype(int)
     df = df.dropna(subset=["target"])
 
-    # Downsample to hourly: every DOWNSAMPLE-th row so each sequence step = 1 hour.
-    # This gives TFT genuine temporal variation across its 240-step (10-day) window.
-    df = df.iloc[::DOWNSAMPLE].reset_index(drop=True)
-
-    print(f"  TFT training rows: {len(df):,} (hourly)  label balance: {df['target'].mean():.3f}  "
+    # Input is already 4h-sampled from tft_merged — no downsampling needed here.
+    print(f"  TFT training rows: {len(df):,} (4h-sampled)  label balance: {df['target'].mean():.3f}  "
           f"dynamic={len(dynamic_cols)} static={len(static_cols)}", flush=True)
 
     X = df[all_cols].values   # [n, n_dynamic + n_static]
@@ -387,12 +374,14 @@ def _load_n_static() -> int:
 
 
 def _infer_batch(model, scaler, X_dynamic, X_static, batch_size):
-    """Run batch inference for one model (shared by single and ensemble paths)."""
-    X_all    = np.concatenate([X_dynamic, X_static], axis=1)
-    X_hourly = X_all[::DOWNSAMPLE]
-    X_sc     = scaler.transform(X_hourly).astype(np.float32)
-    n        = len(X_sc)
-    probs_h  = np.full(n, 0.5, dtype=np.float32)
+    """
+    Run batch inference for one model. Input is already 4h-sampled from tft_merged.
+    No downsampling needed.
+    """
+    X_all = np.concatenate([X_dynamic, X_static], axis=1)
+    X_sc  = scaler.transform(X_all).astype(np.float32)
+    n     = len(X_sc)
+    probs = np.full(n, 0.5, dtype=np.float32)
     n_batches = max(1, (n - SEQ_LEN + batch_size - 1) // batch_size)
     for b in range(n_batches):
         b_start = b * batch_size
@@ -402,18 +391,15 @@ def _infer_batch(model, scaler, X_dynamic, X_static, batch_size):
         abs_idx = np.arange(SEQ_LEN + b_start, SEQ_LEN + b_end)
         win_idx = abs_idx[:, None] + np.arange(-SEQ_LEN + 1, 1)[None, :]
         preds   = model.predict(X_sc[win_idx], verbose=0, batch_size=batch_size)
-        probs_h[SEQ_LEN + b_start: SEQ_LEN + b_end] = preds.flatten()
-    probs_m = np.full(len(X_all), 0.5, dtype=np.float32)
-    for i, p in enumerate(probs_h):
-        probs_m[i * DOWNSAMPLE] = p
-    return probs_m
+        probs[SEQ_LEN + b_start: SEQ_LEN + b_end] = preds.flatten()
+    return probs
 
 
 def predict_proba_batch(X_dynamic: np.ndarray, X_static: np.ndarray,
                          batch_size: int = 512) -> np.ndarray:
     """
     Batch inference. Auto-uses ensemble (N_ENSEMBLE seeds averaged) if trained,
-    otherwise falls back to single model. Downsamples to hourly internally.
+    otherwise falls back to single model. Input must be pre-sampled at 4h intervals.
     """
     if _ensemble_ready():
         all_probs = []
@@ -432,11 +418,10 @@ def predict_proba_batch(X_dynamic: np.ndarray, X_static: np.ndarray,
 def predict_proba(X_dynamic: np.ndarray, X_static: np.ndarray) -> float:
     """
     Single-sample inference. Auto-uses ensemble if trained.
-    X_dynamic must have at least SEQ_LEN * DOWNSAMPLE rows.
+    X_dynamic must have at least SEQ_LEN rows (already 4h-sampled).
     """
     X_all = np.concatenate([X_dynamic, X_static], axis=1)
-    idx   = np.arange(len(X_all) - 1, -1, -DOWNSAMPLE)[::-1]
-    X_h   = X_all[idx][-SEQ_LEN:]
+    X_h   = X_all[-SEQ_LEN:]
 
     if _ensemble_ready():
         preds = []

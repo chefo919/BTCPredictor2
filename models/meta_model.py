@@ -38,20 +38,25 @@ MODEL_PATH = os.path.join(MODEL_DIR, "meta_xgb.pkl")
 
 AGREE_THRESH = 0.10   # route to gate when |p_tft - p_bilstm| >= this
 
-# Market context snapshot fed to the correctness gate
+# Market context snapshot fed to the correctness gate.
+# Combined from both bilstm_merged (m15/h1) and tft_merged (h4/d1) at inference time.
 GATE_MARKET_FEATURES = [
-    "rsi",              # 1m immediate momentum
-    "m15_rsi",          # 15m short-term momentum
-    "vol_ratio",        # 1m volume anomaly (spike = conviction)
-    "body_ratio",       # 1m candle direction intensity
+    # Short-term context (from bilstm_merged: m15_* + h1_*)
+    "m15_rsi",          # 15m momentum
+    "m15_vol_ratio",    # 15m volume anomaly (spike = conviction)
+    "m15_body_ratio",   # 15m candle direction intensity
     "h1_rsi",           # 1H momentum
+    "h1_atr_norm",      # 1H volatility
+    "h1_bb_width",      # 1H volatility regime
+    # Macro context (from tft_merged: h4_* + d1_*)
     "h4_rsi",           # 4H momentum
     "d1_rsi",           # 1D macro regime
-    "h1_atr_norm",      # 1H volatility
     "h4_atr_norm",      # 4H volatility
+    "d1_atr_norm",      # 1D volatility
     "d1_macd_diff_pct", # macro trend direction
     "h4_adx",           # trend strength — key regime discriminator
-    "h1_bb_width",      # intraday volatility regime
+    "d1_adx",           # 1D trend strength
+    "h4_bb_width",      # 4H volatility regime
 ]
 
 
@@ -109,8 +114,8 @@ def train(val_df: pd.DataFrame,
     val_df["actual"] = (val_df["close"].shift(-HORIZON) > val_df["close"]).astype(int)
     val_df = val_df.dropna(subset=["actual"]).reset_index(drop=True)
 
-    # val_tft_probs[i] predicts (close[i+60] > close[i]) — same indexing as val_df.
-    # val_df after dropna keeps rows 0..n-61 (the last 60 rows become NaN after shift(-60)).
+    # val_tft_probs[i] predicts (close[i+1440] > close[i]) — same indexing as val_df.
+    # val_df after dropna keeps rows 0..n-HORIZON (the last HORIZON rows become NaN after shift(-HORIZON)).
     # So probs[:n_valid] aligns row-for-row with val_df. The original [-n_valid:] creates
     # a 60-row temporal offset that misaligns TFT probs (which are non-0.5 only at
     # every 60th row) with their corresponding targets.

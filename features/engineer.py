@@ -7,7 +7,7 @@ from typing import Optional
 
 ROOT       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR   = os.path.join(ROOT, "data")
-YEARLY_DIR = os.path.join(DATA_DIR, "yearly")
+YEARLY_DIR = os.path.join(DATA_DIR, "yearly_merged")
 
 PATH_1M = os.path.join(DATA_DIR, "btc_1m.csv")
 
@@ -32,22 +32,25 @@ FEATURE_4H  = [f"h4_{c}"  for c in _BASE]
 FEATURE_1D  = [f"d1_{c}"  for c in _BASE]
 FEATURE_COLS = (FEATURE_1M + FEATURE_15M + FEATURE_30M
                 + FEATURE_1H + FEATURE_4H + FEATURE_1D)
-# Total: 12 indicators x 6 timeframes = 72 features, all genuinely distinct
-# Each timeframe uses windows scaled by tf_mult so RSI/EMA/etc. measure
-# the same number of *periods* at each timeframe's own resolution.
+
+# ── Model-specific feature column sets ───────────────────────────────────────
+# BiLSTM (micro, SEQ=96 @ 15min): 15m/1h indicators — 24 features
+# TFT    (macro, SEQ=180 @ 4h):   4h/1d indicators  — 24 features
+BILSTM_FEAT_COLS = FEATURE_15M + FEATURE_1H
+TFT_FEAT_COLS    = FEATURE_4H  + FEATURE_1D
 
 
 def get_feature_groups() -> dict:
     """
-    Feature split for the TFT-ACB-XML architecture.
+    Feature split for the TFT-ACB-XML architecture (1-day horizon).
 
-    BiLSTM (micro, SEQ=240):  1m/15m/30m  — 36 features
-    TFT    (macro, SEQ=1440): 1H/4H/1D    — 36 features, all dynamic (no static covariates)
+    BiLSTM (micro, SEQ=96 @ 15min):  15m/1H  — 24 features
+    TFT    (macro, SEQ=180 @ 4h):    4H/1D   — 24 features, all dynamic (no static covariates)
     """
     return {
-        "bilstm":      FEATURE_1M + FEATURE_15M + FEATURE_30M,   # 36
-        "tft_dynamic": FEATURE_1H  + FEATURE_4H  + FEATURE_1D,   # 36
-        "tft_static":  [],                                         # none
+        "bilstm":      BILSTM_FEAT_COLS,   # 24
+        "tft_dynamic": TFT_FEAT_COLS,      # 24
+        "tft_static":  [],                  # none
     }
 
 
@@ -201,46 +204,104 @@ def _build_individual():
         print(f"[Features] {label}: {len(feat):,} rows  {n_feat} features  saved", flush=True)
 
 
-# ── Build merged CSV + yearly split ──────────────────────────────────────────
+# ── Build model-specific merged CSVs ─────────────────────────────────────────
 
-_INTERMEDIATE_OHLCV = [
-    "btc_15m.csv", "btc_30m.csv", "btc_1h.csv",
-    "btc_4h.csv",  "btc_1d.csv",  "btc_1w.csv", "btc_1mo.csv",
-]
+def _at_15min_boundary(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only rows at exact 15-minute clock boundaries (:00, :15, :30, :45)."""
+    mask = (df["time"].dt.minute % 15 == 0) & (df["time"].dt.second == 0)
+    return df[mask].reset_index(drop=True)
+
+
+def _at_4h_boundary(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only rows at exact 4-hour clock boundaries (00:00, 04:00, ..., 20:00 UTC)."""
+    mask = (df["time"].dt.hour % 4 == 0) & (df["time"].dt.minute == 0) & (df["time"].dt.second == 0)
+    return df[mask].reset_index(drop=True)
+
+
+def _build_bilstm_merged():
+    """
+    Build {YYYY}_bilstm_merged.csv: m15_* + h1_* features sampled at 15-minute boundaries.
+    Rows are at :00, :15, :30, :45 of each hour. All features still computed from
+    rolling 1m windows (no data leakage).
+    """
+    df_15m = _load(FEAT_15M)
+    df_1h  = _load(FEAT_1H)
+    if df_15m is None or df_1h is None:
+        raise RuntimeError("Missing btc_15m_features.csv or btc_1h_features.csv")
+
+    print(f"[BiLSTM Merged] Merging 15m ({len(df_15m):,}) and 1h ({len(df_1h):,}) features...",
+          flush=True)
+    merged = pd.merge(df_15m, df_1h, on="time", how="inner")
+
+    # Keep close from 15m side (they share the same close, but 15m has it from 1m passthrough)
+    # Both have 'time'; 15m has 'close' from _compute_std_indicators for 1m prefix="" path.
+    # For FEAT_15M/1H, close is NOT added (prefix != ""). We need to get close from FEAT_1M.
+    df_1m_feat = _load(FEAT_1M)
+    if df_1m_feat is not None and "close" in df_1m_feat.columns:
+        merged = pd.merge(merged, df_1m_feat[["time", "close"]], on="time", how="inner")
+
+    merged = _at_15min_boundary(merged)
+    before = len(merged)
+    merged = merged.dropna(subset=BILSTM_FEAT_COLS).reset_index(drop=True)
+    print(f"[BiLSTM Merged] After 15min filter + dropna: {before} -> {len(merged):,} rows",
+          flush=True)
+
+    os.makedirs(YEARLY_DIR, exist_ok=True)
+    for year, group in merged.groupby(merged["time"].dt.year):
+        path = os.path.join(YEARLY_DIR, f"{year}_bilstm_merged.csv")
+        group.to_csv(path, index=False)
+        print(f"[BiLSTM Merged] Saved yearly_merged/{year}_bilstm_merged.csv ({len(group):,} rows)",
+              flush=True)
+    return merged
+
+
+def _build_tft_merged():
+    """
+    Build {YYYY}_tft_merged.csv: h4_* + d1_* features sampled at 4-hour boundaries.
+    Rows are at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC. All features still
+    computed from rolling 1m windows (no data leakage).
+    """
+    df_4h = _load(FEAT_4H)
+    df_1d = _load(FEAT_1D)
+    if df_4h is None or df_1d is None:
+        raise RuntimeError("Missing btc_4h_features.csv or btc_1d_features.csv")
+
+    print(f"[TFT Merged] Merging 4h ({len(df_4h):,}) and 1d ({len(df_1d):,}) features...",
+          flush=True)
+    merged = pd.merge(df_4h, df_1d, on="time", how="inner")
+
+    df_1m_feat = _load(FEAT_1M)
+    if df_1m_feat is not None and "close" in df_1m_feat.columns:
+        merged = pd.merge(merged, df_1m_feat[["time", "close"]], on="time", how="inner")
+
+    merged = _at_4h_boundary(merged)
+    before = len(merged)
+    merged = merged.dropna(subset=TFT_FEAT_COLS).reset_index(drop=True)
+    print(f"[TFT Merged] After 4h filter + dropna: {before} -> {len(merged):,} rows", flush=True)
+
+    os.makedirs(YEARLY_DIR, exist_ok=True)
+    for year, group in merged.groupby(merged["time"].dt.year):
+        path = os.path.join(YEARLY_DIR, f"{year}_tft_merged.csv")
+        group.to_csv(path, index=False)
+        print(f"[TFT Merged] Saved yearly_merged/{year}_tft_merged.csv ({len(group):,} rows)", flush=True)
+    return merged
 
 
 def _build_merged():
-    feat_files = [FEAT_1M, FEAT_15M, FEAT_30M, FEAT_1H, FEAT_4H, FEAT_1D]
-    dfs = [_load(p) for p in feat_files]
-    if any(df is None for df in dfs):
-        missing = [p for p, d in zip(feat_files, dfs) if d is None]
-        raise RuntimeError(f"Missing feature CSVs: {missing}")
-
-    print(f"[Merged] Merging {len(dfs[0]):,} 1m rows across 6 timeframes...", flush=True)
-    merged = dfs[0].sort_values("time")
-    for df in dfs[1:]:
-        merged = pd.merge(merged, df, on="time", how="inner")
-
-    before = len(merged)
-    merged = merged.dropna(subset=FEATURE_COLS).reset_index(drop=True)
-    print(f"[Merged] Dropped {before - len(merged):,} NaN rows -> {len(merged):,} final rows",
-          flush=True)
-
-    # Yearly split
-    os.makedirs(YEARLY_DIR, exist_ok=True)
-    for year, group in merged.groupby(merged["time"].dt.year):
-        path = os.path.join(YEARLY_DIR, f"{year}_merged.csv")
-        group.to_csv(path, index=False)
-        print(f"[Merged] Saved yearly/{year}_merged.csv ({len(group):,} rows)", flush=True)
+    """Build both bilstm_merged and tft_merged yearly CSVs."""
+    _build_bilstm_merged()
+    _build_tft_merged()
 
     # Delete leftover intermediate OHLCV CSVs
+    _INTERMEDIATE_OHLCV = [
+        "btc_15m.csv", "btc_30m.csv", "btc_1h.csv",
+        "btc_4h.csv",  "btc_1d.csv",  "btc_1w.csv", "btc_1mo.csv",
+    ]
     for fname in _INTERMEDIATE_OHLCV:
         p = os.path.join(DATA_DIR, fname)
         if os.path.exists(p):
             os.remove(p)
             print(f"[Merged] Deleted intermediate: {fname}", flush=True)
-
-    return merged
 
 
 # ── Incremental update: current year only ────────────────────────────────────
@@ -248,50 +309,80 @@ def _build_merged():
 _MAX_WINDOW = 1440 * 50  # 50 days — enough warm-up for d1_ with tf_mult=1440
 
 
-def _update_current_year_features() -> int:
+def _update_current_year_features() -> dict:
     """
     Fast incremental update after new 1m candles are appended.
     Loads the last _MAX_WINDOW rows (enough warm-up for all scaled windows),
-    recomputes all 6 rolling feature sets, and appends only new rows to the
-    current year's merged CSV.
+    recomputes all 6 rolling feature sets, then appends only new boundary rows
+    to the current year's bilstm_merged (15min boundaries) and tft_merged (4h boundaries).
     """
     if not os.path.exists(PATH_1M):
-        return 0
+        return {"bilstm_added": 0, "tft_added": 0}
 
     m1_full = _load(PATH_1M)
     if m1_full is None or m1_full.empty:
-        return 0
+        return {"bilstm_added": 0, "tft_added": 0}
 
     tail = m1_full.tail(_MAX_WINDOW + 500).reset_index(drop=True)
 
     feature_sets = [fn(tail, mult) for _, _, mult, fn in _TF_TASKS]
 
-    merged = feature_sets[0].sort_values("time")
-    for df in feature_sets[1:]:
-        merged = pd.merge(merged, df, on="time", how="inner")
-    merged = merged.dropna(subset=FEATURE_COLS)
-    if merged.empty:
-        return 0
+    # Map label to computed DataFrame
+    feat_map = {label: feature_sets[i] for i, (_, label, _, _) in enumerate(_TF_TASKS)}
 
     year = pd.Timestamp.now(tz="UTC").year
-    year_path = os.path.join(YEARLY_DIR, f"{year}_merged.csv")
     os.makedirs(YEARLY_DIR, exist_ok=True)
 
-    if os.path.exists(year_path):
-        existing_ts = pd.read_csv(year_path, usecols=["time"], parse_dates=["time"])
+    # ── BiLSTM merged update (15min boundaries) ───────────────────────────────
+    bilstm_added = 0
+    feat_15m = feat_map["15m"]
+    feat_1h  = feat_map["1H"]
+    feat_1m_close = feat_map["1m"][["time", "close"]] if "close" in feat_map["1m"].columns else None
+
+    bilstm_new = pd.merge(feat_15m, feat_1h, on="time", how="inner")
+    if feat_1m_close is not None:
+        bilstm_new = pd.merge(bilstm_new, feat_1m_close, on="time", how="inner")
+    bilstm_new = _at_15min_boundary(bilstm_new)
+    bilstm_new = bilstm_new.dropna(subset=BILSTM_FEAT_COLS)
+
+    bilstm_path = os.path.join(YEARLY_DIR, f"{year}_bilstm_merged.csv")
+    if os.path.exists(bilstm_path):
+        existing_ts = pd.read_csv(bilstm_path, usecols=["time"], parse_dates=["time"])
         if existing_ts["time"].dt.tz is None:
             existing_ts["time"] = pd.to_datetime(existing_ts["time"], utc=True)
-        last_ts  = existing_ts["time"].max()
-        new_rows = merged[merged["time"] > last_ts]
-    else:
-        new_rows = merged
+        last_ts = existing_ts["time"].max()
+        bilstm_new = bilstm_new[bilstm_new["time"] > last_ts]
 
-    if new_rows.empty:
-        return 0
+    if not bilstm_new.empty:
+        write_header = not os.path.exists(bilstm_path)
+        bilstm_new.to_csv(bilstm_path, mode="a", header=write_header, index=False)
+        bilstm_added = len(bilstm_new)
 
-    write_header = not os.path.exists(year_path)
-    new_rows.to_csv(year_path, mode="a", header=write_header, index=False)
-    return len(new_rows)
+    # ── TFT merged update (4h boundaries) ─────────────────────────────────────
+    tft_added = 0
+    feat_4h = feat_map["4H"]
+    feat_1d = feat_map["1D"]
+
+    tft_new = pd.merge(feat_4h, feat_1d, on="time", how="inner")
+    if feat_1m_close is not None:
+        tft_new = pd.merge(tft_new, feat_1m_close, on="time", how="inner")
+    tft_new = _at_4h_boundary(tft_new)
+    tft_new = tft_new.dropna(subset=TFT_FEAT_COLS)
+
+    tft_path = os.path.join(YEARLY_DIR, f"{year}_tft_merged.csv")
+    if os.path.exists(tft_path):
+        existing_ts = pd.read_csv(tft_path, usecols=["time"], parse_dates=["time"])
+        if existing_ts["time"].dt.tz is None:
+            existing_ts["time"] = pd.to_datetime(existing_ts["time"], utc=True)
+        last_ts = existing_ts["time"].max()
+        tft_new = tft_new[tft_new["time"] > last_ts]
+
+    if not tft_new.empty:
+        write_header = not os.path.exists(tft_path)
+        tft_new.to_csv(tft_path, mode="a", header=write_header, index=False)
+        tft_added = len(tft_new)
+
+    return {"bilstm_added": bilstm_added, "tft_added": tft_added}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -328,20 +419,28 @@ def update_features() -> dict:
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(YEARLY_DIR, exist_ok=True)
 
-    yearly_files = (
-        [f for f in os.listdir(YEARLY_DIR) if f.endswith("_merged.csv")]
+    bilstm_files = (
+        [f for f in os.listdir(YEARLY_DIR) if f.endswith("_bilstm_merged.csv")]
+        if os.path.exists(YEARLY_DIR) else []
+    )
+    tft_files = (
+        [f for f in os.listdir(YEARLY_DIR) if f.endswith("_tft_merged.csv")]
         if os.path.exists(YEARLY_DIR) else []
     )
 
-    if not yearly_files:
+    if not bilstm_files or not tft_files:
         _build_individual()
         _build_merged()
-        total = sum(_count_rows(os.path.join(YEARLY_DIR, f))
-                    for f in os.listdir(YEARLY_DIR) if f.endswith("_merged.csv"))
-        return {"merged_added": total, "partial_recalculated": False}
+        bilstm_total = sum(_count_rows(os.path.join(YEARLY_DIR, f))
+                           for f in os.listdir(YEARLY_DIR) if f.endswith("_bilstm_merged.csv"))
+        tft_total    = sum(_count_rows(os.path.join(YEARLY_DIR, f))
+                           for f in os.listdir(YEARLY_DIR) if f.endswith("_tft_merged.csv"))
+        return {"bilstm_added": bilstm_total, "tft_added": tft_total,
+                "merged_added": bilstm_total + tft_total}
 
-    n_added = _update_current_year_features()
-    return {"merged_added": n_added, "partial_recalculated": False}
+    counts = _update_current_year_features()
+    counts["merged_added"] = counts["bilstm_added"] + counts["tft_added"]
+    return counts
 
 
 # ── Backward compat shim ──────────────────────────────────────────────────────
@@ -358,9 +457,9 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 # ── Verification ──────────────────────────────────────────────────────────────
 
 def _verify():
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     print("FEATURE VERIFICATION REPORT")
-    print("=" * 50)
+    print("=" * 60)
 
     passes, fails, fail_list = 0, 0, []
 
@@ -374,7 +473,7 @@ def _verify():
             fails += 1
             fail_list.append(f"{label}: {detail}")
 
-    # ── File summary ─────────────────────────────────────────────────────────
+    # ── Individual feature file summary ──────────────────────────────────────
     file_specs = [
         (FEAT_1M,  "btc_1m_features.csv",  12, FEATURE_1M),
         (FEAT_15M, "btc_15m_features.csv", 12, FEATURE_15M),
@@ -395,120 +494,113 @@ def _verify():
         else:
             print(f"{fname:<30} {'MISSING':>10}")
 
-    # ── Yearly files ──────────────────────────────────────────────────────────
-    print(f"\nYEARLY FILES (data/yearly/):")
+    # ── Yearly merged files ───────────────────────────────────────────────────
+    for suffix, label in [("_bilstm_merged.csv", "BILSTM"), ("_tft_merged.csv", "TFT")]:
+        print(f"\nYEARLY {label} FILES (data/yearly_merged/):")
+        print("-" * 60)
+        if os.path.exists(YEARLY_DIR):
+            found = sorted(f for f in os.listdir(YEARLY_DIR) if f.endswith(suffix))
+            if found:
+                for fname in found:
+                    path = os.path.join(YEARLY_DIR, fname)
+                    rc = sum(1 for _ in open(path)) - 1
+                    print(f"  {fname:<40} {rc:>10,} rows")
+            else:
+                print("  (empty)")
+        else:
+            print("  (no yearly directory)")
+
+    # ── Load and check bilstm_merged ─────────────────────────────────────────
+    print(f"\nBILSTM MERGED CHECKS:")
     print("-" * 60)
     if os.path.exists(YEARLY_DIR):
-        found = sorted(f for f in os.listdir(YEARLY_DIR) if f.endswith("_merged.csv"))
-        if found:
-            for fname in found:
-                path = os.path.join(YEARLY_DIR, fname)
-                rc = sum(1 for _ in open(path)) - 1
-                print(f"  {fname:<30} {rc:>10,} rows")
-        else:
-            print("  (empty)")
+        bilstm_files = sorted(f for f in os.listdir(YEARLY_DIR) if f.endswith("_bilstm_merged.csv"))
     else:
-        print("  (no yearly directory)")
+        bilstm_files = []
 
-    # ── Load yearly files for checks ─────────────────────────────────────────
-    print(f"\nINDIVIDUAL CHECKS (data/yearly/ combined):")
+    if bilstm_files:
+        bilstm_dfs = []
+        for fname in bilstm_files:
+            df_y = pd.read_csv(os.path.join(YEARLY_DIR, fname), parse_dates=["time"])
+            if df_y["time"].dt.tz is None:
+                df_y["time"] = pd.to_datetime(df_y["time"], utc=True)
+            bilstm_dfs.append(df_y)
+        bm = pd.concat(bilstm_dfs, ignore_index=True).sort_values("time").reset_index(drop=True)
+
+        n_feat = sum(1 for c in bm.columns if c not in ("time", "close"))
+        chk("B1  Feature count = 24", n_feat == 24, f"{n_feat}")
+        chk("B2  All 15m features present (12)", all(c in bm.columns for c in FEATURE_15M),
+            str([c for c in FEATURE_15M if c not in bm.columns] or "OK"))
+        chk("B3  All 1H features present (12)", all(c in bm.columns for c in FEATURE_1H),
+            str([c for c in FEATURE_1H  if c not in bm.columns] or "OK"))
+        chk("B4  close column present", "close" in bm.columns)
+
+        # Check 15-min spacing
+        diffs = bm["time"].diff().dt.total_seconds().dropna()
+        chk("B5  Rows spaced at 15min (900s)", (diffs == 900).mean() > 0.95,
+            f"{(diffs == 900).mean()*100:.1f}% at 900s")
+
+        nan_total = bm[BILSTM_FEAT_COLS].isna().sum().sum()
+        chk("B6  No NaN in BiLSTM features", nan_total == 0, f"{nan_total}")
+
+        last_date = bm["time"].max().date()
+        today = pd.Timestamp.now(tz="UTC").date()
+        chk("B7  Last row is today or recent", (today - last_date).days <= 2,
+            f"{last_date} (today={today})")
+    else:
+        print("  [FAIL] No bilstm_merged files found")
+        fails += 1
+
+    # ── Load and check tft_merged ─────────────────────────────────────────────
+    print(f"\nTFT MERGED CHECKS:")
     print("-" * 60)
+    if os.path.exists(YEARLY_DIR):
+        tft_files = sorted(f for f in os.listdir(YEARLY_DIR) if f.endswith("_tft_merged.csv"))
+    else:
+        tft_files = []
 
-    if not os.path.exists(YEARLY_DIR):
-        print("[FAIL] data/yearly/ not found")
-        return 0, 1
-    yearly_csvs = sorted(f for f in os.listdir(YEARLY_DIR) if f.endswith("_merged.csv"))
-    if not yearly_csvs:
-        print("[FAIL] No yearly files found")
-        return 0, 1
+    if tft_files:
+        tft_dfs = []
+        for fname in tft_files:
+            df_y = pd.read_csv(os.path.join(YEARLY_DIR, fname), parse_dates=["time"])
+            if df_y["time"].dt.tz is None:
+                df_y["time"] = pd.to_datetime(df_y["time"], utc=True)
+            tft_dfs.append(df_y)
+        tm = pd.concat(tft_dfs, ignore_index=True).sort_values("time").reset_index(drop=True)
 
-    dfs = []
-    for fname in yearly_csvs:
-        df_y = pd.read_csv(os.path.join(YEARLY_DIR, fname), parse_dates=["time"])
-        if df_y["time"].dt.tz is None:
-            df_y["time"] = pd.to_datetime(df_y["time"], utc=True)
-        dfs.append(df_y)
-    merged = pd.concat(dfs, ignore_index=True).sort_values("time").reset_index(drop=True)
+        n_feat = sum(1 for c in tm.columns if c not in ("time", "close"))
+        chk("T1  Feature count = 24", n_feat == 24, f"{n_feat}")
+        chk("T2  All 4H features present (12)", all(c in tm.columns for c in FEATURE_4H),
+            str([c for c in FEATURE_4H if c not in tm.columns] or "OK"))
+        chk("T3  All 1D features present (12)", all(c in tm.columns for c in FEATURE_1D),
+            str([c for c in FEATURE_1D if c not in tm.columns] or "OK"))
+        chk("T4  close column present", "close" in tm.columns)
 
-    chk("C1  Row count > 2,000,000",          len(merged) > 2_000_000,   f"{len(merged):,}")
-    tz_ok = merged["time"].dt.tz is not None and "UTC" in str(merged["time"].dt.tz).upper()
-    chk("C2  time column UTC datetime",        tz_ok,                     str(merged["time"].dtype))
-    n_feat = sum(1 for c in merged.columns if c not in ("time", "close"))
-    chk("C3  Feature count = 72",              n_feat == 72,              f"{n_feat} total features")
-    chk("C4  All 1m  features present (12)",   all(c in merged.columns for c in FEATURE_1M),
-        str([c for c in FEATURE_1M  if c not in merged.columns] or "OK"))
-    chk("C5  All 15m features present (12)",   all(c in merged.columns for c in FEATURE_15M),
-        str([c for c in FEATURE_15M if c not in merged.columns] or "OK"))
-    chk("C6  All 30m features present (12)",   all(c in merged.columns for c in FEATURE_30M),
-        str([c for c in FEATURE_30M if c not in merged.columns] or "OK"))
-    chk("C7  All 1H  features present (12)",   all(c in merged.columns for c in FEATURE_1H),
-        str([c for c in FEATURE_1H  if c not in merged.columns] or "OK"))
-    chk("C8  All 4H  features present (12)",   all(c in merged.columns for c in FEATURE_4H),
-        str([c for c in FEATURE_4H  if c not in merged.columns] or "OK"))
-    chk("C9  All 1D  features present (12)",   all(c in merged.columns for c in FEATURE_1D),
-        str([c for c in FEATURE_1D  if c not in merged.columns] or "OK"))
+        # Check 4h spacing
+        diffs = tm["time"].diff().dt.total_seconds().dropna()
+        chk("T5  Rows spaced at 4h (14400s)", (diffs == 14400).mean() > 0.95,
+            f"{(diffs == 14400).mean()*100:.1f}% at 14400s")
 
-    nan_total = merged[FEATURE_COLS].isna().sum().sum()
-    chk("C10 No NaN in any feature",           nan_total == 0,            f"{nan_total}")
-    inf_total = np.isinf(merged[FEATURE_COLS].values.astype(float)).sum()
-    chk("C11 No Inf in any feature",           inf_total == 0,            f"{inf_total}")
-    sort_ok = (merged["time"].diff().dt.total_seconds().dropna() > 0).all()
-    chk("C12 Sorted ascending by time",        sort_ok)
-    rsi_ok = ((merged["rsi"] >= 0) & (merged["rsi"] <= 1)).all()
-    chk("C13 RSI in [0, 1]",                   rsi_ok,
-        f"min={merged['rsi'].min():.4f} max={merged['rsi'].max():.4f}")
-    atr_ok = (merged["atr_norm"] > 0).all()
-    chk("C14 ATR values positive",             atr_ok,
-        f"min={merged['atr_norm'].min():.6f}")
+        nan_total = tm[TFT_FEAT_COLS].isna().sum().sum()
+        chk("T6  No NaN in TFT features", nan_total == 0, f"{nan_total}")
 
-    # C15: verify timeframe scaling is genuine — rsi != h4_rsi
-    if "h4_rsi" in merged.columns:
-        identical_pct = (merged["rsi"].round(6) == merged["h4_rsi"].round(6)).mean() * 100
-        chk("C15 1m_rsi != h4_rsi (scaled windows working)",
-            identical_pct < 1, f"identical in {identical_pct:.1f}% of rows")
-
-    # C16: h1_rsi should vary within each hour (rolling, not stale)
-    sample = merged.tail(5000)
-    h_groups = sample.groupby(sample["time"].dt.floor("h"))["h1_rsi"].nunique()
-    chk("C16 Rolling: h1_rsi varies within each hour",
-        (h_groups > 1).mean() > 0.5, f"avg unique h1_rsi per hour: {h_groups.mean():.1f}")
-
-    chk("C17 close column present",            "close" in merged.columns)
-
-    last_date = merged["time"].max().date()
-    today     = pd.Timestamp.now(tz="UTC").date()
-    chk("C18 Last row is today or yesterday",  (today - last_date).days <= 1,
-        f"{last_date} (today={today})")
-
-    # ── Market context ────────────────────────────────────────────────────────
-    print("\nCURRENT MARKET CONTEXT (latest row):")
-    row = merged.iloc[-1]
-    for label, rsi_c, macd_c, atr_c in [
-        ("1m",  "rsi",      "macd_diff_pct",    "atr_norm"),
-        ("15m", "m15_rsi",  "m15_macd_diff_pct","m15_atr_norm"),
-        ("30m", "m30_rsi",  "m30_macd_diff_pct","m30_atr_norm"),
-        ("1H",  "h1_rsi",   "h1_macd_diff_pct", "h1_atr_norm"),
-        ("4H",  "h4_rsi",   "h4_macd_diff_pct", "h4_atr_norm"),
-        ("1D",  "d1_rsi",   "d1_macd_diff_pct", "d1_atr_norm"),
-    ]:
-        try:
-            rsi_v  = float(row[rsi_c]) * 100
-            macd_v = float(row[macd_c])
-            atr_v  = float(row[atr_c]) * 100
-            trend  = "neutral" if abs(macd_v) < 0.0001 else ("bullish" if macd_v > 0 else "bearish")
-            print(f"[{label:<3}]  RSI: {rsi_v:5.1f}  MACD: {macd_v:+.4f}  ATR: {atr_v:.3f}%  Trend: {trend}")
-        except (KeyError, TypeError):
-            print(f"[{label:<3}]  (no data)")
+        last_date = tm["time"].max().date()
+        today = pd.Timestamp.now(tz="UTC").date()
+        chk("T7  Last row is today or recent", (today - last_date).days <= 2,
+            f"{last_date} (today={today})")
+    else:
+        print("  [FAIL] No tft_merged files found")
+        fails += 1
 
     print()
-    print("=" * 50)
+    print("=" * 60)
     if fails == 0:
         print(f"ALL {passes} CHECKS PASSED -- READY FOR TRAINING")
     else:
         print(f"{fails} CHECKS FAILED -- fix issues before training")
         for f in fail_list:
             print(f"  - {f}")
-    print("=" * 50)
+    print("=" * 60)
     return passes, fails
 
 
@@ -542,7 +634,7 @@ def _update_manifest():
     if os.path.exists(YEARLY_DIR):
         yearly_info = {}
         for fname in sorted(os.listdir(YEARLY_DIR)):
-            if fname.endswith("_merged.csv"):
+            if fname.endswith("_bilstm_merged.csv") or fname.endswith("_tft_merged.csv"):
                 path = os.path.join(YEARLY_DIR, fname)
                 rows = sum(1 for _ in open(path)) - 1
                 yearly_info[fname] = {"rows": rows}

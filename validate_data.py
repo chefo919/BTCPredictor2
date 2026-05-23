@@ -281,42 +281,57 @@ def main():
             _p(FAIL, f"{label}: entirely-NaN columns: {list(all_nan.index)}")
 
     # ── 4. Yearly merged files ───────────────────────────────────────────────
-    yearly_dir = os.path.join(DATA_DIR, "yearly")
+    yearly_dir = os.path.join(DATA_DIR, "yearly_merged")
     print()
     print(SEP2)
-    print("YEARLY MERGED FILES (data/yearly/)")
+    print("YEARLY MERGED FILES (data/yearly_merged/)")
     print(SEP2)
 
     if os.path.exists(yearly_dir):
-        yearly_files = sorted(f for f in os.listdir(yearly_dir) if f.endswith("_merged.csv"))
-        if yearly_files:
-            for fname in yearly_files:
-                path = os.path.join(yearly_dir, fname)
-                df_y = pd.read_csv(path, parse_dates=["time"], nrows=1)
-                rc   = sum(1 for _ in open(path)) - 1
-                _p(INFO, f"{fname}: {rc:,} rows")
-            _p(PASS, f"Found {len(yearly_files)} yearly file(s)")
+        bilstm_files = sorted(f for f in os.listdir(yearly_dir) if f.endswith("_bilstm_merged.csv"))
+        tft_files    = sorted(f for f in os.listdir(yearly_dir) if f.endswith("_tft_merged.csv"))
+        for fname in bilstm_files + tft_files:
+            path = os.path.join(yearly_dir, fname)
+            rc   = sum(1 for _ in open(path)) - 1
+            _p(INFO, f"{fname}: {rc:,} rows")
+        if bilstm_files:
+            _p(PASS, f"Found {len(bilstm_files)} bilstm_merged file(s)")
         else:
-            _p(WARN, "yearly/ directory exists but no YYYY_merged.csv files found")
+            _p(WARN, "No YYYY_bilstm_merged.csv files found — run features/engineer.py")
+        if tft_files:
+            _p(PASS, f"Found {len(tft_files)} tft_merged file(s)")
+        else:
+            _p(WARN, "No YYYY_tft_merged.csv files found — run features/engineer.py")
     else:
-        _p(WARN, "data/yearly/ directory not found — run features/engineer.py first")
+        _p(WARN, "data/yearly_merged/ directory not found — run features/engineer.py first")
 
     # ── 5. Merged checks via yearly files ────────────────────────────────────
+    def _load_merged_type(pattern):
+        dfs = []
+        if os.path.exists(yearly_dir):
+            for fname in sorted(os.listdir(yearly_dir)):
+                if fname.endswith(f"_{pattern}.csv"):
+                    df_y = pd.read_csv(os.path.join(yearly_dir, fname), parse_dates=["time"])
+                    if df_y["time"].dt.tz is None:
+                        df_y["time"] = pd.to_datetime(df_y["time"], utc=True)
+                    dfs.append(df_y)
+        return pd.concat(dfs, ignore_index=True).sort_values("time").reset_index(drop=True) if dfs else None
+
     print()
-    print("Loading yearly files for merged checks...")
-    dfs = []
-    if os.path.exists(yearly_dir):
-        for fname in sorted(os.listdir(yearly_dir)):
-            if fname.endswith("_merged.csv"):
-                df_y = pd.read_csv(os.path.join(yearly_dir, fname), parse_dates=["time"])
-                if df_y["time"].dt.tz is None:
-                    df_y["time"] = pd.to_datetime(df_y["time"], utc=True)
-                dfs.append(df_y)
-    if dfs:
-        merged = pd.concat(dfs, ignore_index=True).sort_values("time").reset_index(drop=True)
-        check_merged(merged)
+    print("Loading bilstm_merged for merged checks...")
+    merged_bilstm = _load_merged_type("bilstm_merged")
+    if merged_bilstm is not None:
+        check_merged(merged_bilstm)
     else:
-        _p(WARN, "No yearly merged files found — run features/engineer.py first")
+        _p(WARN, "No bilstm_merged files found — run features/engineer.py first")
+
+    print()
+    print("Loading tft_merged for merged checks...")
+    merged_tft = _load_merged_type("tft_merged")
+    if merged_tft is not None:
+        check_merged(merged_tft)
+    else:
+        _p(WARN, "No tft_merged files found — run features/engineer.py first")
 
     # ── 6. Summary ───────────────────────────────────────────────────────────
     print()

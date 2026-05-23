@@ -8,6 +8,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"]  = "2"
 
 import sys
 import time
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -19,11 +20,11 @@ try:
 except RuntimeError:
     pass  # already initialized (e.g. imported after another TF module)
 
-from features.engineer import FEATURE_COLS, get_feature_groups
+from features.engineer import (BILSTM_FEAT_COLS, TFT_FEAT_COLS, get_feature_groups)
 from models import tft_model, bilstm_model, meta_model
 
 ROOT       = os.path.dirname(os.path.dirname(__file__))
-YEARLY_DIR = os.path.join(ROOT, "data", "yearly")
+YEARLY_DIR = os.path.join(ROOT, "data", "yearly_merged")
 STAMP_PATH = os.path.join(ROOT, "models", "saved", "last_train_rows.txt")
 
 from config import TRAINING_CUTOFF_DATE
@@ -54,15 +55,16 @@ def should_retrain(current_rows: int, threshold: int = 1000) -> bool:
     return (current_rows - last) >= threshold or last == 0
 
 
-def load_and_engineer() -> pd.DataFrame:
+def _load_yearly(suffix: str) -> pd.DataFrame:
+    """Load all yearly CSV files matching the given suffix into a single DataFrame."""
     if not os.path.exists(YEARLY_DIR):
-        print("data/yearly/ not found. Run features/engineer.py first.", flush=True)
+        print(f"data/yearly_merged/ not found. Run features/engineer.py first.", flush=True)
         sys.exit(1)
     start_ts  = pd.Timestamp(TRAINING_START, tz="UTC")
     cutoff_ts = pd.Timestamp(TRAINING_CUTOFF_DATE, tz="UTC")
     dfs = []
     for fname in sorted(os.listdir(YEARLY_DIR)):
-        if not fname.endswith("_merged.csv"):
+        if not fname.endswith(suffix):
             continue
         df_y = pd.read_csv(os.path.join(YEARLY_DIR, fname), parse_dates=["time"])
         if df_y["time"].dt.tz is None:
@@ -71,11 +73,28 @@ def load_and_engineer() -> pd.DataFrame:
         if not df_y.empty:
             dfs.append(df_y)
     if not dfs:
-        print(f"No data between {TRAINING_START} and {TRAINING_CUTOFF_DATE}. Check data/yearly/.", flush=True)
+        print(f"No data in {suffix} files between {TRAINING_START} and {TRAINING_CUTOFF_DATE}.",
+              flush=True)
         sys.exit(1)
     df = pd.concat(dfs, ignore_index=True).sort_values("time").reset_index(drop=True)
-    print(f"Loaded {len(df):,} rows from {len(dfs)} yearly files "
-          f"({TRAINING_START} -> {TRAINING_CUTOFF_DATE}, {len(FEATURE_COLS)} features).", flush=True)
+    return df
+
+
+def load_bilstm_data() -> pd.DataFrame:
+    """Load 15min-sampled bilstm_merged files (m15_* + h1_* + close + time)."""
+    df = _load_yearly("_bilstm_merged.csv")
+    print(f"BiLSTM data: {len(df):,} rows "
+          f"({TRAINING_START} -> {TRAINING_CUTOFF_DATE}, {len(BILSTM_FEAT_COLS)} features).",
+          flush=True)
+    return df
+
+
+def load_tft_data() -> pd.DataFrame:
+    """Load 4h-sampled tft_merged files (h4_* + d1_* + close + time)."""
+    df = _load_yearly("_tft_merged.csv")
+    print(f"TFT data: {len(df):,} rows "
+          f"({TRAINING_START} -> {TRAINING_CUTOFF_DATE}, {len(TFT_FEAT_COLS)} features).",
+          flush=True)
     return df
 
 
@@ -96,39 +115,41 @@ def _ram_available() -> str:
     return "unknown"
 
 
-
 def run_training(force: bool = False, test_mode: bool = False):
-    df           = load_and_engineer()   # already filtered to [TRAINING_START, TRAINING_CUTOFF_DATE]
-    current_rows = len(df)
+    groups           = get_feature_groups()
+    BILSTM_FEATURES  = groups["bilstm"]        # m15/h1 — 24 features
+    TFT_DYN_FEATURES = groups["tft_dynamic"]   # h4/d1  — 24 features
+    TFT_STA_FEATURES = groups["tft_static"]    # none
+
+    df_bilstm = load_bilstm_data()
+    df_tft    = load_tft_data()
+
+    current_rows = len(df_bilstm) + len(df_tft)
 
     if not force:
         print("Use --force to run training. Skipping.")
         return
 
     if test_mode:
-        df = df.tail(10000).copy()
-        print(f"[TEST MODE] Limiting to last {len(df):,} rows, 3 epochs.", flush=True)
+        df_bilstm = df_bilstm.tail(5000).copy()
+        df_tft    = df_tft.tail(1000).copy()
+        print(f"[TEST MODE] BiLSTM: {len(df_bilstm):,} rows, TFT: {len(df_tft):,} rows, 3 epochs.",
+              flush=True)
 
-    # ── Feature groups — each model gets a specialized subset ────────────────
-    groups           = get_feature_groups()
-    BILSTM_FEATURES  = groups["bilstm"]        # 1m/15m/30m — 30 features
-    TFT_DYN_FEATURES = groups["tft_dynamic"]   # h1/h4/d1   — 30 features
-    TFT_STA_FEATURES = groups["tft_static"]    # w1/mo1     — 27 features
-    ALL_NEEDED       = BILSTM_FEATURES + TFT_DYN_FEATURES + TFT_STA_FEATURES
-
-    n_clean = len(df.dropna(subset=ALL_NEEDED))
-    t0      = time.time()
-
+    t0  = time.time()
     SEP = "=" * 46
+
     print()
     print(SEP)
     print("TFT-ACB-XML STACKING TRAINING (arXiv 2602.12380)")
     print(SEP)
-    print(f"Phase 1/3: TFT  (macro, SEQ_LEN={tft_model.SEQ_LEN}, dynamic={len(TFT_DYN_FEATURES)}, static={len(TFT_STA_FEATURES)})")
-    print(f"Phase 2/3: BiLSTM/ACB (micro, SEQ_LEN={bilstm_model.SEQ_LEN}, features={len(BILSTM_FEATURES)})")
-    print(f"Phase 3/3: XGBoost meta-learner (error-reciprocal weighting)")
-    print(f"Training rows:   {n_clean:,}")
-    print(f"Target:          price direction {tft_model.HORIZON} minutes ahead")
+    print(f"Phase 1/3: TFT  (macro, SEQ_LEN={tft_model.SEQ_LEN}, 4h-sampled, "
+          f"dynamic={len(TFT_DYN_FEATURES)}, horizon={tft_model.HORIZON}min)")
+    print(f"Phase 2/3: BiLSTM/ACB (micro, SEQ_LEN={bilstm_model.SEQ_LEN}, 15min-sampled, "
+          f"features={len(BILSTM_FEATURES)}, horizon={bilstm_model.HORIZON}min)")
+    print(f"Phase 3/3: XGBoost meta-learner (full multi-timeframe gate snapshot)")
+    print(f"TFT rows:    {len(df_tft):,}  |  BiLSTM rows: {len(df_bilstm):,}")
+    print(f"Target:      price direction {tft_model.HORIZON} minutes (1 day) ahead")
     print(SEP)
     print()
 
@@ -143,68 +164,121 @@ def run_training(force: bool = False, test_mode: bool = False):
         tft_model.N_EPOCHS    = 3
         bilstm_model.N_EPOCHS = 3
 
-    # ── Phase 1: Train TFT on 70% ────────────────────────────────────────────
+    # ── Phase 1: Train TFT on 4h-sampled data ────────────────────────────────
     if tft_model.is_trained():
         tft_acc     = _saved_acc.get("tft", 0.51)
         tft_val_err = 1.0 - _saved_acc.get("tft_val", tft_acc)
         print(f"[1/3] TFT already trained — skipping  (saved acc: {tft_acc:.3f})")
     else:
-        print(f"[1/3] Training TFT ensemble ({tft_model.N_ENSEMBLE} seeds, SEQ_LEN={tft_model.SEQ_LEN}, HORIZON={tft_model.HORIZON})...")
+        print(f"[1/3] Training TFT ensemble ({tft_model.N_ENSEMBLE} seeds, "
+              f"SEQ_LEN={tft_model.SEQ_LEN}, HORIZON={tft_model.HORIZON})...")
         t_tft        = time.time()
-        tft_results  = tft_model.train_ensemble(df, TFT_DYN_FEATURES, TFT_STA_FEATURES)
+        tft_results  = tft_model.train_ensemble(df_tft, TFT_DYN_FEATURES, TFT_STA_FEATURES)
         tft_elapsed  = time.time() - t_tft
         tft_acc      = float(np.mean([r["test_acc"] for r in tft_results]))
         tft_val_err  = 1.0 - float(np.mean([r.get("val_acc", r["test_acc"]) for r in tft_results]))
         print(f"\nTFT ensemble complete | Avg accuracy: {tft_acc:.3f} | Time: {_fmt(tft_elapsed)}")
     print()
 
-    # ── Phase 2: Train BiLSTM/ACB ─────────────────────────────────────────────
+    # ── Phase 2: Train BiLSTM/ACB on 15min-sampled data ──────────────────────
     if bilstm_model.is_trained():
         bilstm_acc     = _saved_acc.get("bilstm", 0.51)
         bilstm_val_err = 1.0 - _saved_acc.get("bilstm_val", bilstm_acc)
         print(f"[2/3] BiLSTM already trained — skipping  (saved acc: {bilstm_acc:.3f})")
     else:
-        print(f"[2/3] Training BiLSTM ensemble ({bilstm_model.N_ENSEMBLE} seeds, SEQ_LEN={bilstm_model.SEQ_LEN}, HORIZON={bilstm_model.HORIZON})...")
+        print(f"[2/3] Training BiLSTM ensemble ({bilstm_model.N_ENSEMBLE} seeds, "
+              f"SEQ_LEN={bilstm_model.SEQ_LEN}, HORIZON={bilstm_model.HORIZON})...")
         t_bilstm        = time.time()
-        bilstm_results  = bilstm_model.train_ensemble(df, BILSTM_FEATURES)
+        bilstm_results  = bilstm_model.train_ensemble(df_bilstm, BILSTM_FEATURES)
         bilstm_elapsed  = time.time() - t_bilstm
         bilstm_acc      = float(np.mean([r["test_acc"] for r in bilstm_results]))
-        bilstm_val_err  = 1.0 - float(np.mean([r.get("val_acc", r["test_acc"]) for r in bilstm_results]))
-        print(f"\nBiLSTM ensemble complete | Avg accuracy: {bilstm_acc:.3f} | Time: {_fmt(bilstm_elapsed)}")
+        bilstm_val_err  = 1.0 - float(np.mean([r.get("val_acc", r["test_acc"])
+                                                for r in bilstm_results]))
+        print(f"\nBiLSTM ensemble complete | Avg accuracy: {bilstm_acc:.3f} | "
+              f"Time: {_fmt(bilstm_elapsed)}")
     print()
 
     # ── Phase 3: OOF predictions → train meta ────────────────────────────────
-    # Timeline: [0-70% train] [+24h gap] [72-90% OOF] [+24h gap] [92-100% test]
-    # 24h purge gaps prevent training labels from referencing OOF prices and vice versa.
+    # TFT timeline (4h rows):    [0-70% train] [+6 row gap] [72-90% OOF] [+6 row gap] [test]
+    # BiLSTM timeline (15m rows): [0-70% train] [+96 row gap] [72-90% OOF] [+96 row gap] [test]
+    # 6 TFT rows = 24h; 96 BiLSTM rows = 24h — same real-time purge gap.
+    # OOF gate snapshot combines both CSVs via nearest-time join.
     print("[3/3] Generating OOF predictions and training XGBoost meta-learner...")
-    df_clean  = df.dropna(subset=ALL_NEEDED).reset_index(drop=True)
-    n_total   = len(df_clean)
-    PURGE     = 24 * 60   # 24-hour purge gap in 1-minute rows
 
-    train_end  = int(n_total * 0.70)
-    oof_start  = train_end  + PURGE          # skip 24h after training ends
-    oof_end    = int(n_total * 0.90)
-    test_start = oof_end    + PURGE          # skip 24h between OOF and test
+    df_tft_clean    = df_tft.dropna(subset=TFT_DYN_FEATURES).reset_index(drop=True)
+    df_bilstm_clean = df_bilstm.dropna(subset=BILSTM_FEATURES).reset_index(drop=True)
+    n_tft    = len(df_tft_clean)
+    n_bilstm = len(df_bilstm_clean)
 
-    df_oof  = df_clean.iloc[oof_start:oof_end].copy()    # ~19% — meta training
-    df_test = df_clean.iloc[test_start:].copy()           # ~9%  — final evaluation
+    PURGE_TFT    = 6    # 24h / 4h = 6 rows in tft_merged
+    PURGE_BILSTM = 96   # 24h / 15min = 96 rows in bilstm_merged
 
-    print(f"  OOF window: rows {oof_start:,}-{oof_end:,} ({len(df_oof):,} rows, "
-          f"24h purge on each side)", flush=True)
+    tft_train_end  = int(n_tft    * 0.70)
+    tft_oof_start  = tft_train_end  + PURGE_TFT
+    tft_oof_end    = int(n_tft    * 0.90)
 
-    val_X_dyn  = df_oof[TFT_DYN_FEATURES].values.astype("float32")
-    val_X_sta  = df_oof[TFT_STA_FEATURES].values.astype("float32")
-    val_X_bi   = df_oof[BILSTM_FEATURES].values.astype("float32")
+    bi_train_end   = int(n_bilstm * 0.70)
+    bi_oof_start   = bi_train_end   + PURGE_BILSTM
+    bi_oof_end     = int(n_bilstm * 0.90)
 
-    print(f"  Generating TFT OOF predictions on {len(df_oof):,} rows...", flush=True)
-    val_tft_probs    = tft_model.predict_proba_batch(val_X_dyn, val_X_sta)
-    print(f"  Generating BiLSTM OOF predictions on {len(df_oof):,} rows...", flush=True)
-    val_bilstm_probs = bilstm_model.predict_proba_batch(val_X_bi)
+    df_tft_oof    = df_tft_clean.iloc[tft_oof_start:tft_oof_end].copy()
+    df_bilstm_oof = df_bilstm_clean.iloc[bi_oof_start:bi_oof_end].copy()
+
+    print(f"  TFT OOF:    rows {tft_oof_start:,}-{tft_oof_end:,} ({len(df_tft_oof):,} rows)",
+          flush=True)
+    print(f"  BiLSTM OOF: rows {bi_oof_start:,}-{bi_oof_end:,} ({len(df_bilstm_oof):,} rows)",
+          flush=True)
+
+    val_X_dyn = df_tft_oof[TFT_DYN_FEATURES].values.astype("float32")
+    val_X_sta = df_tft_oof[TFT_STA_FEATURES].values.astype("float32")
+    val_X_bi  = df_bilstm_oof[BILSTM_FEATURES].values.astype("float32")
+
+    print(f"  Generating TFT OOF predictions on {len(df_tft_oof):,} rows...", flush=True)
+    val_tft_probs = tft_model.predict_proba_batch(val_X_dyn, val_X_sta)
+
+    print(f"  Generating BiLSTM OOF predictions on {len(df_bilstm_oof):,} rows...", flush=True)
+    val_bilstm_probs_full = bilstm_model.predict_proba_batch(val_X_bi)
+
+    # ── Align BiLSTM OOF onto TFT timestamps for the combined gate snapshot ───
+    # Each TFT row (4h) maps to the nearest BiLSTM row (15min) via merge_asof.
+    # This gives the gate a full multi-timeframe snapshot at each 4h decision point.
+    df_bi_oof_probs = df_bilstm_oof[["time"]].copy()
+    df_bi_oof_probs["bilstm_prob"] = val_bilstm_probs_full
+
+    df_tft_oof_probs = df_tft_oof[["time"]].copy()
+    df_tft_oof_probs["tft_idx"] = np.arange(len(df_tft_oof))
+
+    # Sort required for merge_asof
+    df_bi_oof_probs  = df_bi_oof_probs.sort_values("time")
+    df_tft_oof_probs = df_tft_oof_probs.sort_values("time")
+
+    aligned = pd.merge_asof(
+        df_tft_oof_probs,
+        df_bi_oof_probs,
+        on="time",
+        direction="nearest",
+    )
+
+    val_bilstm_probs_aligned = aligned["bilstm_prob"].values.astype("float32")
+    val_tft_probs_aligned    = val_tft_probs[aligned["tft_idx"].values]
+
+    # Build combined snapshot DataFrame: TFT features + nearest BiLSTM features
+    bilstm_oof_sorted = df_bilstm_oof.sort_values("time").reset_index(drop=True)
+    df_combined = pd.merge_asof(
+        df_tft_oof.sort_values("time").reset_index(drop=True),
+        bilstm_oof_sorted[["time"] + BILSTM_FEATURES],
+        on="time",
+        direction="nearest",
+    )
+
+    ALL_GATE_FEATURES = TFT_DYN_FEATURES + BILSTM_FEATURES
 
     t_meta       = time.time()
-    meta_results = meta_model.train(df_oof, val_tft_probs, val_bilstm_probs,
-                                     tft_val_err, bilstm_val_err,
-                                     TFT_DYN_FEATURES + TFT_STA_FEATURES)
+    meta_results = meta_model.train(df_combined,
+                                    val_tft_probs_aligned,
+                                    val_bilstm_probs_aligned,
+                                    tft_val_err, bilstm_val_err,
+                                    ALL_GATE_FEATURES)
     meta_elapsed = time.time() - t_meta
     print(f"\nMeta-learner complete | CV acc: {meta_results['train_acc']:.3f} | "
           f"Time: {_fmt(meta_elapsed)}")
@@ -219,7 +293,7 @@ def run_training(force: bool = False, test_mode: bool = False):
                     "bilstm": bilstm_acc, "bilstm_val": 1.0 - bilstm_val_err,
                     "meta": meta_results["train_acc"]}, _f, indent=2)
 
-    cutoff_ts   = str(df["time"].iloc[-1])
+    cutoff_ts   = str(df_tft["time"].iloc[-1])
     cutoff_path = os.path.join(ROOT, "models", "saved", "training_cutoff.txt")
     with open(cutoff_path, "w") as _f:
         _f.write(cutoff_ts)
@@ -249,11 +323,11 @@ if __name__ == "__main__":
 
     if config_only:
         import json as _json
-        df        = load_and_engineer()
-        _sel_path = os.path.join(ROOT, "models", "saved", "selected_features.json")
-        active    = (_json.load(open(_sel_path))["selected"]
-                     if os.path.exists(_sel_path) else FEATURE_COLS)
-        n_clean   = len(df.dropna(subset=active))
-        print(f"Adaptive TFT config: {n_clean:,} rows, {len(active)} features, HORIZON={tft_model.HORIZON}")
+        df_tft    = load_tft_data()
+        df_bilstm = load_bilstm_data()
+        print(f"TFT config:    {len(df_tft):,} rows, {len(TFT_FEAT_COLS)} features, "
+              f"HORIZON={tft_model.HORIZON}")
+        print(f"BiLSTM config: {len(df_bilstm):,} rows, {len(BILSTM_FEAT_COLS)} features, "
+              f"HORIZON={bilstm_model.HORIZON}")
     else:
         run_training(force=force, test_mode=test_mode)

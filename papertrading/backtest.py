@@ -19,20 +19,20 @@ import tensorflow as tf
 tf.get_logger().setLevel("ERROR")
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
-from features.engineer import FEATURE_COLS, get_feature_groups
+from features.engineer import get_feature_groups, BILSTM_FEAT_COLS, TFT_FEAT_COLS
 from models.tft_model    import GRN, VSN, _StaticGRN, SEQ_LEN as SEQ_TFT
-from models.bilstm_model import _SumPool, _PVAttention
+from models.bilstm_model import _SumPool, _PVAttention, SEQ_LEN as SEQ_BILSTM
 from models import bilstm_model as _bilstm_mod, meta_model as _meta_mod
 
-_groups          = get_feature_groups()
-BILSTM_FEATURES  = _groups["bilstm"]
-TFT_DYN_FEATURES = _groups["tft_dynamic"]
-TFT_STA_FEATURES = _groups["tft_static"]
-ACTIVE_FEATURES  = BILSTM_FEATURES + TFT_DYN_FEATURES + TFT_STA_FEATURES
+_groups           = get_feature_groups()
+BILSTM_FEATURES   = _groups["bilstm"]
+TFT_DYN_FEATURES  = _groups["tft_dynamic"]
+TFT_STA_FEATURES  = _groups["tft_static"]
+ALL_GATE_FEATURES = TFT_DYN_FEATURES + BILSTM_FEATURES
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 ROOT          = os.path.dirname(os.path.dirname(__file__))
-YEARLY_DIR    = os.path.join(ROOT, "data", "yearly")
+YEARLY_DIR    = os.path.join(ROOT, "data", "yearly_merged")
 MODELS_DIR    = os.path.join(ROOT, "models", "saved")
 BACKTESTS_DIR = os.path.join(os.path.dirname(__file__), "backtests")
 
@@ -40,10 +40,11 @@ BACKTESTS_DIR = os.path.join(os.path.dirname(__file__), "backtests")
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from config import (FEE_RATE, STOP_LOSS_PCT, TAKE_PROFIT_PCT,
-                    MIN_HOLD_MIN as MIN_HOLD_ROWS, MAX_HOLD_MIN as MAX_HOLD_ROWS,
-                    CHOP_FILTER_PCT, BUY_THRESHOLD, SELL_THRESHOLD, STARTING_USDT)
+                    MIN_HOLD_MIN, MAX_HOLD_MIN,
+                    CHOP_FILTER_PCT, BUY_THRESHOLD, SELL_THRESHOLD, STARTING_USDT,
+                    TFT_SAMPLE_INTERVAL)
 DEFAULT_CAPITAL = STARTING_USDT
-INFER_BATCH     = 128   # TFT attention [B,4,1440,1440] — 512 crashes A100
+INFER_BATCH     = 128   # TFT attention [B,4,SEQ,SEQ] — 512 crashes A100
 
 SEP = "=" * 46
 
@@ -70,73 +71,102 @@ def _load_models():
                    custom_objects={"_SumPool": _SumPool, "_PVAttention": _PVAttention})
     bilstm_s = joblib.load(bi_s_path)
 
-    # Support both old format (keys: model, weights) and new routing format
     meta_saved = joblib.load(meta_path)
-    meta_w = meta_saved.get("static_weights", meta_saved.get("weights", {"tft": 0.5, "bilstm": 0.5}))
-    n_dis  = meta_saved.get("n_disagree", 0)
-    thresh = meta_saved.get("agree_thresh", 0.10)
+    meta_w   = meta_saved.get("static_weights", {"tft": 0.5, "bilstm": 0.5})
     has_gate = meta_saved.get("gate_model") is not None
+    n_dis    = meta_saved.get("n_disagree", 0)
+    thresh   = meta_saved.get("agree_thresh", 0.10)
     print(f"[Backtest] Models loaded — static weights TFT: {meta_w['tft']:.3f}  "
           f"BiLSTM: {meta_w['bilstm']:.3f}  "
           f"gate: {'active' if has_gate else 'off'} "
           f"({n_dis:,} training rows, thresh={thresh})", flush=True)
-    return tft_m, tft_s, bilstm_m, bilstm_s, meta_w
+    return tft_m, tft_s, bilstm_m, bilstm_s
 
 
 # ── Batch inference ───────────────────────────────────────────────────────────
 
-def _batch_infer(X_tft_dyn, X_tft_sta, X_bi, times_all, first_idx,
-                  tft_m, tft_s, bilstm_m, bilstm_s, meta_w, df):
-    n          = len(X_tft_dyn) - first_idx
-    n_batches  = (n + INFER_BATCH - 1) // INFER_BATCH
-    SEQ_BILSTM = _bilstm_mod.SEQ_LEN
+def _batch_infer(df_tft, df_bilstm, first_idx_tft, first_idx_bilstm,
+                  tft_m, tft_s, bilstm_m, bilstm_s):
+    """
+    Run TFT inference on 4h-sampled tft_merged, BiLSTM inference on 15min-sampled
+    bilstm_merged, align results via merge_asof, then run meta-learner routing.
+    Returns final_probs array aligned to df_tft rows starting at first_idx_tft.
+    """
+    n_tft    = len(df_tft) - first_idx_tft
+    n_bilstm = len(df_bilstm) - first_idx_bilstm
 
-    # ── TFT inference (dynamic + static concatenated for scaler) ─────────────
+    # ── TFT inference ─────────────────────────────────────────────────────────
     print("[Backtest] Running TFT inference...", flush=True)
-    X_tft_all = np.concatenate([X_tft_dyn, X_tft_sta], axis=1)
+    X_tft_all = df_tft[TFT_DYN_FEATURES].values.astype(np.float32)
     tft_sc    = tft_s.transform(X_tft_all).astype(np.float32)
-    tft_probs = np.full(n, 0.5, dtype=np.float32)
+    tft_probs = np.full(n_tft, 0.5, dtype=np.float32)
+    n_batches = (n_tft + INFER_BATCH - 1) // INFER_BATCH
+    times_tft = df_tft["time"].values
     last_pct  = -1
     for b in range(n_batches):
         b_start = b * INFER_BATCH
-        b_end   = min(b_start + INFER_BATCH, n)
-        abs_idx = np.arange(first_idx + b_start, first_idx + b_end)
+        b_end   = min(b_start + INFER_BATCH, n_tft)
+        abs_idx = np.arange(first_idx_tft + b_start, first_idx_tft + b_end)
         win_idx = abs_idx[:, None] + np.arange(-SEQ_TFT + 1, 1)[None, :]
         preds   = tft_m.predict(tft_sc[win_idx], verbose=0, batch_size=INFER_BATCH)
         tft_probs[b_start:b_end] = preds.flatten()
-        pct = int(b_end / n * 50)
+        pct = int(b_end / n_tft * 50)
         if pct // 10 > last_pct // 10:
-            row_ts = pd.Timestamp(times_all[first_idx + b_end - 1]).strftime("%b %Y")
+            row_ts = pd.Timestamp(times_tft[first_idx_tft + b_end - 1]).strftime("%b %Y")
             print(f"[Backtest] TFT... {pct}% ({row_ts})", flush=True)
             last_pct = pct
     del tft_sc
 
-    # ── BiLSTM inference (1m/15m/30m features only) ───────────────────────────
+    # ── BiLSTM inference ──────────────────────────────────────────────────────
     print("[Backtest] Running BiLSTM inference...", flush=True)
-    bilstm_sc    = bilstm_s.transform(X_bi).astype(np.float32)
-    bilstm_probs = np.full(n, 0.5, dtype=np.float32)
+    X_bi_all     = df_bilstm[BILSTM_FEATURES].values.astype(np.float32)
+    bilstm_sc    = bilstm_s.transform(X_bi_all).astype(np.float32)
+    bilstm_raw   = np.full(n_bilstm, 0.5, dtype=np.float32)
+    n_batches_bi = (n_bilstm + INFER_BATCH - 1) // INFER_BATCH
+    times_bi     = df_bilstm["time"].values
     last_pct = -1
-    for b in range(n_batches):
+    for b in range(n_batches_bi):
         b_start = b * INFER_BATCH
-        b_end   = min(b_start + INFER_BATCH, n)
-        abs_idx = np.arange(first_idx + b_start, first_idx + b_end)
+        b_end   = min(b_start + INFER_BATCH, n_bilstm)
+        abs_idx = np.arange(first_idx_bilstm + b_start, first_idx_bilstm + b_end)
         win_idx = abs_idx[:, None] + np.arange(-SEQ_BILSTM + 1, 1)[None, :]
         win_idx = np.clip(win_idx, 0, len(bilstm_sc) - 1)
         preds   = bilstm_m.predict(bilstm_sc[win_idx], verbose=0, batch_size=INFER_BATCH)
-        bilstm_probs[b_start:b_end] = preds.flatten()
-        pct = 50 + int(b_end / n * 40)
+        bilstm_raw[b_start:b_end] = preds.flatten()
+        pct = 50 + int(b_end / n_bilstm * 40)
         if pct // 10 > last_pct // 10:
-            row_ts = pd.Timestamp(times_all[first_idx + b_end - 1]).strftime("%b %Y")
+            row_ts = pd.Timestamp(times_bi[first_idx_bilstm + b_end - 1]).strftime("%b %Y")
             print(f"[Backtest] BiLSTM... {pct}% ({row_ts})", flush=True)
             last_pct = pct
     del bilstm_sc
 
-    # ── Agreement-based routing meta-learner ─────────────────────────────────
+    # ── Align bilstm probs onto tft timestamps ────────────────────────────────
+    tft_times_active = pd.DatetimeIndex(times_tft[first_idx_tft:])
+    bi_times_active  = pd.DatetimeIndex(times_bi[first_idx_bilstm:])
+    _df_bi_p  = pd.DataFrame({"time": bi_times_active,  "p_bi": bilstm_raw})
+    _df_tft_t = pd.DataFrame({"time": tft_times_active})
+    _aligned  = pd.merge_asof(_df_tft_t.sort_values("time"),
+                               _df_bi_p.sort_values("time"),
+                               on="time", direction="nearest",
+                               tolerance=pd.Timedelta("3h"))
+    bilstm_probs = _aligned["p_bi"].fillna(0.5).values.astype(np.float32)
+
+    # ── Build combined gate snapshot ──────────────────────────────────────────
+    tft_slice    = df_tft.iloc[first_idx_tft:].reset_index(drop=True)
+    bilstm_slice = df_bilstm.iloc[first_idx_bilstm:].reset_index(drop=True)
+    bilstm_snap  = pd.merge_asof(
+        tft_slice[["time"]].sort_values("time"),
+        bilstm_slice[["time"] + BILSTM_FEATURES].sort_values("time"),
+        on="time", direction="nearest", tolerance=pd.Timedelta("3h"),
+    ).drop(columns=["time"])
+    df_gate = pd.concat([tft_slice[TFT_DYN_FEATURES].reset_index(drop=True),
+                          bilstm_snap.reset_index(drop=True)], axis=1)
+
+    # ── Agreement-based routing meta-learner ──────────────────────────────────
     print("[Backtest] Running meta-learner (agreement-based routing)...", flush=True)
     final_probs = _meta_mod.predict_proba_batch(tft_probs, bilstm_probs,
-                                                  df.iloc[first_idx:].reset_index(drop=True),
-                                                  ACTIVE_FEATURES)
-    print(f"[Backtest] Processing... 100%", flush=True)
+                                                  df_gate, ALL_GATE_FEATURES)
+    print("[Backtest] Processing... 100%", flush=True)
     return final_probs
 
 
@@ -155,7 +185,8 @@ def _simulate(df, first_idx, tft_probs, starting_capital):
 
     usdt    = float(starting_capital)
     btc     = 0.0
-    entry_price = entry_row = cost_basis = 0.0
+    entry_price = cost_basis = 0.0
+    entry_row   = 0
     entry_time  = None
 
     trades   = []
@@ -168,11 +199,11 @@ def _simulate(df, first_idx, tft_probs, starting_capital):
     def _do_sell(abs_i, price, reason):
         nonlocal usdt, btc, entry_price, entry_row, cost_basis, entry_time
         nonlocal win_trades, loss_trades
-        gross = btc * price
-        fee   = gross * FEE_RATE
-        net   = gross - fee
-        pnl   = net - cost_basis
-        hold_rows = abs_i - entry_row
+        gross    = btc * price
+        fee      = gross * FEE_RATE
+        net      = gross - fee
+        pnl      = net - cost_basis
+        hold_min = (pd.Timestamp(times_arr[abs_i]) - pd.Timestamp(times_arr[entry_row])).total_seconds() / 60
         if pnl >= 0:
             win_trades += 1
         else:
@@ -188,13 +219,14 @@ def _simulate(df, first_idx, tft_probs, starting_capital):
             "net":        round(net, 2),
             "pnl":        round(pnl, 2),
             "pnl_pct":    round(pnl / cost_basis * 100, 3),
-            "hold_rows":  hold_rows,
+            "hold_min":   round(hold_min, 0),
             "reason":     reason,
         })
         exits[reason].append(pnl)
         usdt        = net
         btc         = 0.0
-        entry_price = entry_row = cost_basis = 0.0
+        entry_price = cost_basis = 0.0
+        entry_row   = 0
         entry_time  = None
         return pnl
 
@@ -218,17 +250,17 @@ def _simulate(df, first_idx, tft_probs, starting_capital):
 
         # ── Exit ──────────────────────────────────────────────────────────────
         if btc > 0:
-            pnl_frac  = (price - entry_price) / entry_price
-            hold_rows = abs_i - entry_row
-            reason    = None
+            pnl_frac = (price - entry_price) / entry_price
+            hold_min = (pd.Timestamp(times_arr[abs_i]) - pd.Timestamp(times_arr[entry_row])).total_seconds() / 60
+            reason   = None
 
             if pnl_frac <= -STOP_LOSS_PCT:
                 reason = "STOP_LOSS"
             elif pnl_frac >= TAKE_PROFIT_PCT:
                 reason = "TAKE_PROFIT"
-            elif hold_rows >= MAX_HOLD_ROWS:
+            elif hold_min >= MAX_HOLD_MIN:
                 reason = "MAX_HOLD"
-            elif signal == "SELL" and conf in ("HIGH", "MEDIUM") and hold_rows >= MIN_HOLD_ROWS:
+            elif signal == "SELL" and conf in ("HIGH", "MEDIUM") and hold_min >= MIN_HOLD_MIN:
                 reason = "SIGNAL"
 
             if reason:
@@ -320,7 +352,7 @@ def _compute_stats(result, capital, df, first_idx, start_dt, end_dt):
         monthly[m] += t["pnl"]
         monthly_cnt[m] += 1
 
-    hold_times = [t["hold_rows"] for t in sell_trades if "hold_rows" in t]
+    hold_times = [t["hold_min"] for t in sell_trades if "hold_min" in t]
     avg_hold   = np.mean(hold_times) if hold_times else 0
 
     pnls = [t["pnl"] for t in sell_trades]
@@ -377,7 +409,8 @@ def _print_results(s, start_dt, end_dt):
     print(f"Losing:           {s['losses']}  ({100-s['win_rate']:.1f}%)")
     print(f"Best trade:       +${s['best']:.2f}  ({s['best_time']})")
     print(f"Worst trade:      -${abs(s['worst']):.2f}  ({s['worst_time']})")
-    print(f"Avg hold time:    {s['avg_hold']:.0f} minutes")
+    avg_h = s['avg_hold']
+    print(f"Avg hold time:    {avg_h:.0f} min  ({avg_h/60:.1f} h)")
     print(f"Avg profit/trade: ${s['avg']:.2f}")
     print()
     print("EXIT REASONS")
@@ -426,8 +459,29 @@ def _save_result(s, result, start_dt, end_dt):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _load_yearly_csv(pattern: str, start_dt: pd.Timestamp) -> pd.DataFrame:
+    dfs = []
+    for fname in sorted(os.listdir(YEARLY_DIR)):
+        if not fname.endswith(f"_{pattern}.csv"):
+            continue
+        year = int(fname.split("_")[0])
+        if year < start_dt.year - 1:   # keep one extra year for seq warm-up
+            continue
+        df_y = pd.read_csv(os.path.join(YEARLY_DIR, fname), parse_dates=["time"])
+        if df_y["time"].dt.tz is None:
+            df_y["time"] = pd.to_datetime(df_y["time"], utc=True)
+        dfs.append(df_y)
+    if not dfs:
+        return None
+    return (pd.concat(dfs, ignore_index=True)
+              .sort_values("time")
+              .drop_duplicates("time")
+              .pipe(lambda d: d[d["time"] <= pd.Timestamp.now(tz="UTC")])
+              .reset_index(drop=True))
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Backtest Adaptive TFT on historical BTC data")
+    parser = argparse.ArgumentParser(description="Backtest TFT-ACB-XML on historical BTC data")
     parser.add_argument("--start",   type=str, required=True,
                         help="Start date (YYYY-MM-DD)")
     parser.add_argument("--capital", type=float, default=DEFAULT_CAPITAL,
@@ -438,55 +492,43 @@ def main():
     end_dt   = pd.Timestamp.now(tz="UTC")
 
     print(f"[Backtest] {start_dt.date()} -> {end_dt.date()}", flush=True)
-    print("[Backtest] Loading yearly feature files...", flush=True)
+    print("[Backtest] Loading tft_merged and bilstm_merged...", flush=True)
 
-    dfs = []
-    for fname in sorted(os.listdir(YEARLY_DIR)):
-        if not fname.endswith("_merged.csv"):
-            continue
-        year = int(fname.split("_")[0])
-        if year < start_dt.year - 1:   # keep one extra year before start for seq warm-up
-            continue
-        df_y = pd.read_csv(os.path.join(YEARLY_DIR, fname), parse_dates=["time"])
-        if df_y["time"].dt.tz is None:
-            df_y["time"] = pd.to_datetime(df_y["time"], utc=True)
-        dfs.append(df_y)
-    if not dfs:
-        print(f"ERROR: No yearly files found in {YEARLY_DIR}")
-        sys.exit(1)
-    df = (pd.concat(dfs, ignore_index=True)
-            .sort_values("time")
-            .reset_index(drop=True)
-            .pipe(lambda d: d[d["time"] <= pd.Timestamp.now(tz="UTC")])
-            .reset_index(drop=True))
-    all_needed = BILSTM_FEATURES + TFT_DYN_FEATURES + TFT_STA_FEATURES
-    df = df.dropna(subset=all_needed).reset_index(drop=True)
-
-    mask      = df["time"] >= start_dt
-    if not mask.any():
-        print(f"ERROR: No data from {args.start}")
+    df_tft    = _load_yearly_csv("tft_merged", start_dt)
+    df_bilstm = _load_yearly_csv("bilstm_merged", start_dt)
+    if df_tft is None or df_bilstm is None:
+        print(f"ERROR: No yearly feature files found in {YEARLY_DIR}. "
+              "Run: python features/engineer.py")
         sys.exit(1)
 
-    candidate = int(np.where(mask.values)[0][0])
-    first_idx = max(candidate, SEQ_TFT + 1)
-    n         = len(df) - first_idx
-    print(f"[Backtest] {n:,} rows to process", flush=True)
+    df_tft    = df_tft.dropna(subset=TFT_DYN_FEATURES).reset_index(drop=True)
+    df_bilstm = df_bilstm.dropna(subset=BILSTM_FEATURES).reset_index(drop=True)
 
-    tft_m, tft_s, bilstm_m, bilstm_s, meta_w = _load_models()
+    mask_tft = df_tft["time"] >= start_dt
+    if not mask_tft.any():
+        print(f"ERROR: No TFT data from {args.start}")
+        sys.exit(1)
 
-    X_tft_dyn = df[TFT_DYN_FEATURES].values.astype(np.float32)
-    X_tft_sta = df[TFT_STA_FEATURES].values.astype(np.float32)
-    X_bi      = df[BILSTM_FEATURES].values.astype(np.float32)
-    times_all = df["time"].values
+    candidate_tft    = int(np.where(mask_tft.values)[0][0])
+    first_idx_tft    = max(candidate_tft, SEQ_TFT + 1)
 
-    final_probs = _batch_infer(X_tft_dyn, X_tft_sta, X_bi, times_all, first_idx,
-                                tft_m, tft_s, bilstm_m, bilstm_s, meta_w, df)
+    mask_bilstm      = df_bilstm["time"] >= start_dt
+    candidate_bilstm = int(np.where(mask_bilstm.values)[0][0]) if mask_bilstm.any() else len(df_bilstm)
+    first_idx_bilstm = max(candidate_bilstm, SEQ_BILSTM + 1)
+
+    n = len(df_tft) - first_idx_tft
+    print(f"[Backtest] {n:,} TFT rows to process", flush=True)
+
+    tft_m, tft_s, bilstm_m, bilstm_s = _load_models()
+
+    final_probs = _batch_infer(df_tft, df_bilstm, first_idx_tft, first_idx_bilstm,
+                                tft_m, tft_s, bilstm_m, bilstm_s)
 
     print("[Backtest] Simulating trades...", flush=True)
-    result = _simulate(df, first_idx, final_probs, args.capital)
+    result = _simulate(df_tft, first_idx_tft, final_probs, args.capital)
     print("[Backtest] Processing... 100% complete", flush=True)
 
-    stats = _compute_stats(result, args.capital, df, first_idx, start_dt, end_dt)
+    stats = _compute_stats(result, args.capital, df_tft, first_idx_tft, start_dt, end_dt)
     _print_results(stats, start_dt, end_dt)
     fpath = _save_result(stats, result, start_dt, end_dt)
     print(f"\nFull trade log saved to: {fpath}")

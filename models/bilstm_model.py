@@ -1,9 +1,12 @@
 """
 Attention-Customized Bidirectional LSTM (ACB) — short-term momentum model.
 
-Inputs:  1m, 15m, 30m features only (30 cols) — high-velocity local signals
-Context: 4 hours of 1-minute candles (SEQ_LEN=240)
-Target:  1-hour price direction (HORIZON=60)
+Inputs:  15m, 1H features (24 cols) — momentum signals sampled at 15-minute intervals
+Context: 24 hours at 15min resolution (SEQ_LEN=96 rows from bilstm_merged)
+Target:  1-day price direction (HORIZON=1440)
+
+Input data comes pre-sampled at 15-minute boundaries from {YYYY}_bilstm_merged.csv,
+so each sequence step represents 15 minutes of real time.
 
 The attention mechanism is price-volume customized:
   attn_score = LSTM_output_score + |MACD| × vol_ratio
@@ -33,11 +36,11 @@ def _seed_scaler_path(s): return os.path.join(MODEL_DIR, f"bilstm_scaler_s{s}.pk
 def _seed_ckpt_dir(s):    return os.path.join(MODEL_DIR, f"checkpoints_bilstm_s{s}")
 def _ensemble_ready():    return all(os.path.exists(_seed_model_path(s)) for s in range(N_ENSEMBLE))
 
-# Feature indices within the 1m/15m/30m feature block (30 features total)
-# 1m features are first 10: rsi(0), macd_diff_pct(1), ema9(2), ema21(3), ema50(4),
-#                            atr_norm(5), bb_pct(6), bb_width(7), obv_zscore(8), vol_ratio(9)
-_MACD_IDX     = 1   # 1m macd_diff_pct — price momentum proxy
-_VOL_IDX      = 9   # 1m vol_ratio    — volume spike indicator
+# Feature indices within the 15m/1H feature block (24 features total)
+# 15m features are first 12: m15_rsi(0), m15_macd_diff_pct(1), m15_ema9(2), ...,
+#                             m15_obv_zscore(8), m15_vol_ratio(9), m15_body_ratio(10), m15_adx(11)
+_MACD_IDX     = 1   # m15_macd_diff_pct — 15m price momentum proxy
+_VOL_IDX      = 9   # m15_vol_ratio     — 15m volume spike indicator
 
 
 def _fmt(seconds: float) -> str:

@@ -31,7 +31,9 @@ import pandas as pd
 
 ROOT      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-from config import HORIZON_META as HORIZON
+from config import HORIZON_META as HORIZON, TFT_SAMPLE_INTERVAL
+
+HORIZON_ROWS = HORIZON // TFT_SAMPLE_INTERVAL  # 1440 min / 240 min-per-row = 6 rows (1 day)
 
 MODEL_DIR  = os.path.join(ROOT, "models", "saved")
 MODEL_PATH = os.path.join(MODEL_DIR, "meta_xgb.pkl")
@@ -111,11 +113,11 @@ def train(val_df: pd.DataFrame,
 
     # ── Ground-truth direction ─────────────────────────────────────────────
     val_df = val_df.copy()
-    val_df["actual"] = (val_df["close"].shift(-HORIZON) > val_df["close"]).astype(int)
+    val_df["actual"] = (val_df["close"].shift(-HORIZON_ROWS) > val_df["close"]).astype(int)
     val_df = val_df.dropna(subset=["actual"]).reset_index(drop=True)
 
-    # val_tft_probs[i] predicts (close[i+1440] > close[i]) — same indexing as val_df.
-    # val_df after dropna keeps rows 0..n-HORIZON (the last HORIZON rows become NaN after shift(-HORIZON)).
+    # val_tft_probs[i] predicts (close[i+HORIZON_ROWS] > close[i]) — same indexing as val_df.
+    # val_df after dropna keeps rows 0..n-HORIZON_ROWS (the last HORIZON_ROWS rows become NaN).
     # So probs[:n_valid] aligns row-for-row with val_df. The original [-n_valid:] creates
     # a 60-row temporal offset that misaligns TFT probs (which are non-0.5 only at
     # every 60th row) with their corresponding targets.

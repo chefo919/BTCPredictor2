@@ -17,7 +17,9 @@ sys.path.insert(0, ROOT)
 from config import (SEQ_LEN_TFT as SEQ_LEN, HORIZON_TFT as HORIZON,
                     N_EPOCHS_TFT as N_EPOCHS, BATCH_TFT as BATCH,
                     STRIDE_TFT as STRIDE, D_MODEL, N_HEADS, DROPOUT_TFT as DROPOUT,
-                    N_ENSEMBLE)
+                    N_ENSEMBLE, TFT_SAMPLE_INTERVAL)
+
+HORIZON_ROWS = HORIZON // TFT_SAMPLE_INTERVAL  # 1440 min / 240 min-per-row = 6 rows (1 day)
 
 MODEL_DIR        = os.path.join(ROOT, "models", "saved")
 MODEL_PATH       = os.path.join(MODEL_DIR, "tft.keras")
@@ -224,7 +226,7 @@ def train(feature_df, dynamic_cols: list, static_cols: list,
 
     all_cols = dynamic_cols + static_cols
     df = feature_df.dropna(subset=all_cols).copy()
-    df["target"] = (df["close"].shift(-HORIZON) > df["close"]).astype(int)
+    df["target"] = (df["close"].shift(-HORIZON_ROWS) > df["close"]).astype(int)
     df = df.dropna(subset=["target"])
 
     # Input is already 4h-sampled from tft_merged — no downsampling needed here.

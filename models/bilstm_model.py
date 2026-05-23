@@ -24,7 +24,9 @@ sys.path.insert(0, ROOT)
 from config import (SEQ_LEN_BILSTM as SEQ_LEN, HORIZON_BILSTM as HORIZON,
                     N_EPOCHS_BILSTM as N_EPOCHS, BATCH_BILSTM as BATCH,
                     STRIDE_BILSTM as STRIDE, DROPOUT_BILSTM as DROPOUT,
-                    N_ENSEMBLE)
+                    N_ENSEMBLE, BILSTM_SAMPLE_INTERVAL)
+
+HORIZON_ROWS = HORIZON // BILSTM_SAMPLE_INTERVAL  # 1440 min / 15 min-per-row = 96 rows (1 day)
 
 MODEL_DIR      = os.path.join(ROOT, "models", "saved")
 MODEL_PATH     = os.path.join(MODEL_DIR, "bilstm.keras")
@@ -170,7 +172,7 @@ def train(feature_df, feature_cols: list, seed: int = None) -> dict:
     t0 = time.time()
 
     df = feature_df.dropna(subset=feature_cols).copy()
-    df["target"] = (df["close"].shift(-HORIZON) > df["close"]).astype(int)
+    df["target"] = (df["close"].shift(-HORIZON_ROWS) > df["close"]).astype(int)
     df = df.dropna(subset=["target"])
     print(f"  BiLSTM training rows: {len(df):,}  label balance: {df['target'].mean():.3f}",
           flush=True)

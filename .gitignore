@@ -1,7 +1,9 @@
-# ── Data (all CSVs are large — never commit) ─────────────────────────────────
-data/
-!data/yearly_merged/
-!data/yearly_merged/*.csv
+# ── Data ──────────────────────────────────────────────────────────────────────
+# Raw price data and per-timeframe feature CSVs — large, regenerated locally
+data/btc_*.csv
+data/backups/
+data/manifest.json
+# data/yearly_merged/ is NOT ignored — 10 CSVs (~90 MB) committed for Colab training
 
 # ── Trained model weights (binary, too large for git) ────────────────────────
 models/saved/*.keras

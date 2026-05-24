@@ -116,8 +116,8 @@ class _Q50Accuracy(tf.keras.metrics.Metric):
     """Binary accuracy using the q50 head (column 1 of the 3-quantile output)."""
     def __init__(self, **kwargs):
         super().__init__(name="q50_acc", **kwargs)
-        self._total   = self.add_weight("total",   initializer="zeros")
-        self._correct = self.add_weight("correct", initializer="zeros")
+        self._total   = self.add_weight(name="total",   shape=(), initializer="zeros")
+        self._correct = self.add_weight(name="correct", shape=(), initializer="zeros")
 
     def update_state(self, y_true, y_pred, sample_weight=None):
         q50   = y_pred[:, 1]

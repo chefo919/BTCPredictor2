@@ -27,7 +27,7 @@ ROOT       = os.path.dirname(os.path.dirname(__file__))
 YEARLY_DIR = os.path.join(ROOT, "data", "yearly_merged")
 STAMP_PATH = os.path.join(ROOT, "models", "saved", "last_train_rows.txt")
 
-from config import (TRAINING_CUTOFF_DATE, STOP_LOSS_PCT, TAKE_PROFIT_PCT,
+from config import (TRAINING_CUTOFF_DATE, LABEL_TP_PCT, LABEL_SL_PCT,
                     HORIZON_TFT, HORIZON_BILSTM)
 from training.labels import apply_triple_barrier
 
@@ -146,10 +146,10 @@ def run_training(force: bool = False, test_mode: bool = False):
 
     # ── Pre-apply triple-barrier labels (Fix 2) ───────────────────────────────
     print("[0/3] Applying triple-barrier labels...", flush=True)
-    df_tft    = apply_triple_barrier(df_tft,    PATH_1M, TAKE_PROFIT_PCT,
-                                     STOP_LOSS_PCT, HORIZON_TFT)
-    df_bilstm = apply_triple_barrier(df_bilstm, PATH_1M, TAKE_PROFIT_PCT,
-                                     STOP_LOSS_PCT, HORIZON_BILSTM)
+    df_tft    = apply_triple_barrier(df_tft,    PATH_1M, LABEL_TP_PCT,
+                                     LABEL_SL_PCT, HORIZON_TFT)
+    df_bilstm = apply_triple_barrier(df_bilstm, PATH_1M, LABEL_TP_PCT,
+                                     LABEL_SL_PCT, HORIZON_BILSTM)
 
     t0  = time.time()
     SEP = "=" * 46

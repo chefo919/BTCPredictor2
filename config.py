@@ -48,8 +48,14 @@ THRESH_LOW_VOL  = 0.60   # buy threshold in quiet market
 THRESH_HIGH_VOL = 0.52   # buy threshold in volatile market
 
 # ── Risk management ───────────────────────────────────────────────────────────
-STOP_LOSS_PCT   = 0.03    # 3%
-TAKE_PROFIT_PCT = 0.06    # 6%
+STOP_LOSS_PCT   = 0.03    # 3%  — live trading exit
+TAKE_PROFIT_PCT = 0.06    # 6%  — live trading exit
+
+# Label generation barriers — decoupled from live trading exits.
+# Symmetric 3%/3% produces ~40-45% positive labels; model learns direction.
+# Live trading still exits at TAKE_PROFIT_PCT / STOP_LOSS_PCT above.
+LABEL_TP_PCT = 0.03
+LABEL_SL_PCT = 0.03
 MIN_HOLD_MIN    = 1440    # minimum hold = one full prediction horizon (1 day)
 MAX_HOLD_MIN    = 4320    # 3 days — let signal drive the exit, not the clock
 CHOP_FILTER_PCT = 0.005   # skip entries when 1H range < 0.5%

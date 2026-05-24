@@ -27,8 +27,16 @@ ROOT       = os.path.dirname(os.path.dirname(__file__))
 YEARLY_DIR = os.path.join(ROOT, "data", "yearly_merged")
 STAMP_PATH = os.path.join(ROOT, "models", "saved", "last_train_rows.txt")
 
-from config import TRAINING_CUTOFF_DATE
+from config import (TRAINING_CUTOFF_DATE, STOP_LOSS_PCT, TAKE_PROFIT_PCT,
+                    HORIZON_TFT, HORIZON_BILSTM)
+from training.labels import apply_triple_barrier
+
 TRAINING_START = "2022-02-01"  # skip first 30d — rolling window warm-up period
+
+# Prefer yearly splits (pushed to GitHub); fall back to monolithic file if present
+_YEARLY_1M_DIR = os.path.join(ROOT, "data", "yearly_1m")
+_MONO_1M       = os.path.join(ROOT, "data", "btc_1m.csv")
+PATH_1M = _YEARLY_1M_DIR if os.path.isdir(_YEARLY_1M_DIR) else _MONO_1M
 
 
 def _fmt(seconds: float) -> str:
@@ -136,6 +144,13 @@ def run_training(force: bool = False, test_mode: bool = False):
         print(f"[TEST MODE] BiLSTM: {len(df_bilstm):,} rows, TFT: {len(df_tft):,} rows, 3 epochs.",
               flush=True)
 
+    # ── Pre-apply triple-barrier labels (Fix 2) ───────────────────────────────
+    print("[0/3] Applying triple-barrier labels...", flush=True)
+    df_tft    = apply_triple_barrier(df_tft,    PATH_1M, TAKE_PROFIT_PCT,
+                                     STOP_LOSS_PCT, HORIZON_TFT)
+    df_bilstm = apply_triple_barrier(df_bilstm, PATH_1M, TAKE_PROFIT_PCT,
+                                     STOP_LOSS_PCT, HORIZON_BILSTM)
+
     t0  = time.time()
     SEP = "=" * 46
 
@@ -234,7 +249,8 @@ def run_training(force: bool = False, test_mode: bool = False):
     val_X_bi  = df_bilstm_oof[BILSTM_FEATURES].values.astype("float32")
 
     print(f"  Generating TFT OOF predictions on {len(df_tft_oof):,} rows...", flush=True)
-    val_tft_probs = tft_model.predict_proba_batch(val_X_dyn, val_X_sta)
+    val_tft_probs = tft_model.predict_proba_batch(val_X_dyn, val_X_sta,
+                                                   timestamps=df_tft_oof["time"])
 
     print(f"  Generating BiLSTM OOF predictions on {len(df_bilstm_oof):,} rows...", flush=True)
     val_bilstm_probs_full = bilstm_model.predict_proba_batch(val_X_bi)

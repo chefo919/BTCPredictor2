@@ -35,10 +35,17 @@ STRIDE_BILSTM     = 4     # 1 sample per hour = every 4 steps in 15min-sampled d
 
 # ── Training ──────────────────────────────────────────────────────────────────
 TRAINING_CUTOFF_DATE = "2026-04-15"
+EXP_WEIGHT_HALFLIFE  = 0.33    # fraction of train set back from end where weight = 0.5
 
 # ── Trading signals ───────────────────────────────────────────────────────────
-BUY_THRESHOLD  = 0.54
+BUY_THRESHOLD  = 0.54   # static fallback (overridden by _dynamic_thresholds when h4_atr_norm available)
 SELL_THRESHOLD = 0.46
+
+# ── Dynamic threshold parameters (Fix 5) ──────────────────────────────────────
+VOL_LOW_ATR    = 0.003  # h4_atr_norm below this → quiet market, require high confidence
+VOL_HIGH_ATR   = 0.010  # h4_atr_norm above this → volatile market, fee easily outpaced
+THRESH_LOW_VOL  = 0.60   # buy threshold in quiet market
+THRESH_HIGH_VOL = 0.52   # buy threshold in volatile market
 
 # ── Risk management ───────────────────────────────────────────────────────────
 STOP_LOSS_PCT   = 0.03    # 3%

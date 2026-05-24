@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import numpy as np
 import pandas as pd
@@ -6,6 +7,8 @@ import ta
 from typing import Optional
 
 ROOT       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+from features.build_ohlcv import aggregate_floor
 DATA_DIR   = os.path.join(ROOT, "data")
 YEARLY_DIR = os.path.join(DATA_DIR, "yearly_merged")
 
@@ -94,6 +97,35 @@ def _rolling_ohlcv_series(df_1m: pd.DataFrame, window: int) -> pd.DataFrame:
     }).dropna().reset_index(drop=True)
 
 
+# ── Proper resampling and anti-lookahead merge ────────────────────────────────
+
+def _resample_and_compute(df_1m: pd.DataFrame, freq: str, prefix: str) -> pd.DataFrame:
+    """
+    Aggregate 1m OHLCV to true native timeframe candles via cardinal UTC boundaries,
+    then compute all 12 indicators with standard windows (tf_mult=1).
+    Returns feature DataFrame that also includes `close` (resampled bar close).
+    """
+    resampled = aggregate_floor(df_1m, freq)
+    feat = _compute_std_indicators(resampled, prefix, tf_mult=1)
+    # Add resampled close (needed for merged CSV target computation)
+    if "close" not in feat.columns and "close" in resampled.columns:
+        feat = pd.merge(feat, resampled[["time", "close"]], on="time", how="left")
+    return feat
+
+
+def _merge_asof_lower_tf(df_high: pd.DataFrame, df_low: pd.DataFrame,
+                          feat_cols: list) -> pd.DataFrame:
+    """
+    Merge lower-frequency indicators onto a higher-frequency DataFrame using
+    merge_asof(direction='backward'): at each high-freq row with timestamp T,
+    use the most recent lower-freq row whose time <= T (i.e. last completed bar).
+    This is the correct anti-lookahead join — no future bar data bleeds back.
+    """
+    df_high = df_high.sort_values("time").reset_index(drop=True)
+    df_low_sub = df_low[["time"] + feat_cols].sort_values("time").reset_index(drop=True)
+    return pd.merge_asof(df_high, df_low_sub, on="time", direction="backward")
+
+
 # ── 12 indicators with timeframe-scaled windows ───────────────────────────────
 
 def _compute_std_indicators(df: pd.DataFrame, prefix: str = "",
@@ -175,15 +207,17 @@ def _compute_std_indicators(df: pd.DataFrame, prefix: str = "",
 
 
 # ── Build individual feature files ────────────────────────────────────────────
-# tf_mult = number of 1m bars in one period of that timeframe
+# Each task: (output_path, label, compute_fn(df_1m) -> DataFrame)
+# 1m path: compute indicators directly on 1m data (tf_mult=1 is correct here)
+# All other timeframes: resample to native candles first, then standard windows
 
 _TF_TASKS = [
-    (FEAT_1M,  "1m",  1,    lambda m1, m: _compute_std_indicators(m1, "",      1)),
-    (FEAT_15M, "15m", 15,   lambda m1, m: _compute_std_indicators(_rolling_ohlcv_series(m1,   15), "m15_",  15)),
-    (FEAT_30M, "30m", 30,   lambda m1, m: _compute_std_indicators(_rolling_ohlcv_series(m1,   30), "m30_",  30)),
-    (FEAT_1H,  "1H",  60,   lambda m1, m: _compute_std_indicators(_rolling_ohlcv_series(m1,   60), "h1_",   60)),
-    (FEAT_4H,  "4H",  240,  lambda m1, m: _compute_std_indicators(_rolling_ohlcv_series(m1,  240), "h4_",  240)),
-    (FEAT_1D,  "1D",  1440, lambda m1, m: _compute_std_indicators(_rolling_ohlcv_series(m1, 1440), "d1_", 1440)),
+    (FEAT_1M,  "1m",  lambda m1: _compute_std_indicators(m1, "",      1)),
+    (FEAT_15M, "15m", lambda m1: _resample_and_compute(m1, "15min", "m15_")),
+    (FEAT_30M, "30m", lambda m1: _resample_and_compute(m1, "30min", "m30_")),
+    (FEAT_1H,  "1H",  lambda m1: _resample_and_compute(m1, "1h",   "h1_")),
+    (FEAT_4H,  "4H",  lambda m1: _resample_and_compute(m1, "4h",   "h4_")),
+    (FEAT_1D,  "1D",  lambda m1: _resample_and_compute(m1, "1D",   "d1_")),
 ]
 
 
@@ -195,10 +229,10 @@ def _build_individual():
 
     print(f"[Features] Loaded btc_1m.csv: {len(m1):,} rows", flush=True)
 
-    for feat_path, label, mult, fn in _TF_TASKS:
-        print(f"[Features] Computing {label} (tf_mult={mult}, "
-              f"RSI={14*mult}, EMA9={9*mult}, BB={20*mult})...", flush=True)
-        feat = fn(m1, mult)
+    for feat_path, label, fn in _TF_TASKS:
+        print(f"[Features] Computing {label} (native resample + standard 14-period windows)...",
+              flush=True)
+        feat = fn(m1)
         feat.to_csv(feat_path, index=False)
         n_feat = len([c for c in feat.columns if c not in ("time", "close")])
         print(f"[Features] {label}: {len(feat):,} rows  {n_feat} features  saved", flush=True)
@@ -220,31 +254,23 @@ def _at_4h_boundary(df: pd.DataFrame) -> pd.DataFrame:
 
 def _build_bilstm_merged():
     """
-    Build {YYYY}_bilstm_merged.csv: m15_* + h1_* features sampled at 15-minute boundaries.
-    Rows are at :00, :15, :30, :45 of each hour. All features still computed from
-    rolling 1m windows (no data leakage).
+    Build {YYYY}_bilstm_merged.csv: m15_* + h1_* features at 15-minute boundaries.
+    FEAT_15M rows are already at :00/:15/:30/:45 from aggregate_floor("15min").
+    h1_* are merged via merge_asof(backward): each 15m row gets the last completed 1H bar.
+    close comes from the 15m resampled close (embedded in FEAT_15M by _resample_and_compute).
     """
     df_15m = _load(FEAT_15M)
     df_1h  = _load(FEAT_1H)
     if df_15m is None or df_1h is None:
         raise RuntimeError("Missing btc_15m_features.csv or btc_1h_features.csv")
 
-    print(f"[BiLSTM Merged] Merging 15m ({len(df_15m):,}) and 1h ({len(df_1h):,}) features...",
+    print(f"[BiLSTM Merged] merge_asof 15m ({len(df_15m):,}) <- 1h ({len(df_1h):,})...",
           flush=True)
-    merged = pd.merge(df_15m, df_1h, on="time", how="inner")
+    merged = _merge_asof_lower_tf(df_15m, df_1h, FEATURE_1H)
 
-    # Keep close from 15m side (they share the same close, but 15m has it from 1m passthrough)
-    # Both have 'time'; 15m has 'close' from _compute_std_indicators for 1m prefix="" path.
-    # For FEAT_15M/1H, close is NOT added (prefix != ""). We need to get close from FEAT_1M.
-    df_1m_feat = _load(FEAT_1M)
-    if df_1m_feat is not None and "close" in df_1m_feat.columns:
-        merged = pd.merge(merged, df_1m_feat[["time", "close"]], on="time", how="inner")
-
-    merged = _at_15min_boundary(merged)
     before = len(merged)
     merged = merged.dropna(subset=BILSTM_FEAT_COLS).reset_index(drop=True)
-    print(f"[BiLSTM Merged] After 15min filter + dropna: {before} -> {len(merged):,} rows",
-          flush=True)
+    print(f"[BiLSTM Merged] After dropna: {before} -> {len(merged):,} rows", flush=True)
 
     os.makedirs(YEARLY_DIR, exist_ok=True)
     for year, group in merged.groupby(merged["time"].dt.year):
@@ -257,33 +283,30 @@ def _build_bilstm_merged():
 
 def _build_tft_merged():
     """
-    Build {YYYY}_tft_merged.csv: h4_* + d1_* features sampled at 4-hour boundaries.
-    Rows are at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC. All features still
-    computed from rolling 1m windows (no data leakage).
+    Build {YYYY}_tft_merged.csv: h4_* + d1_* features at 4-hour boundaries.
+    FEAT_4H rows are already at 4h boundaries from aggregate_floor("4h").
+    d1_* are merged via merge_asof(backward): each 4h row gets the last completed 1D bar.
+    close comes from the 4h resampled close (embedded in FEAT_4H by _resample_and_compute).
     """
     df_4h = _load(FEAT_4H)
     df_1d = _load(FEAT_1D)
     if df_4h is None or df_1d is None:
         raise RuntimeError("Missing btc_4h_features.csv or btc_1d_features.csv")
 
-    print(f"[TFT Merged] Merging 4h ({len(df_4h):,}) and 1d ({len(df_1d):,}) features...",
+    print(f"[TFT Merged] merge_asof 4h ({len(df_4h):,}) <- 1d ({len(df_1d):,})...",
           flush=True)
-    merged = pd.merge(df_4h, df_1d, on="time", how="inner")
+    merged = _merge_asof_lower_tf(df_4h, df_1d, FEATURE_1D)
 
-    df_1m_feat = _load(FEAT_1M)
-    if df_1m_feat is not None and "close" in df_1m_feat.columns:
-        merged = pd.merge(merged, df_1m_feat[["time", "close"]], on="time", how="inner")
-
-    merged = _at_4h_boundary(merged)
     before = len(merged)
     merged = merged.dropna(subset=TFT_FEAT_COLS).reset_index(drop=True)
-    print(f"[TFT Merged] After 4h filter + dropna: {before} -> {len(merged):,} rows", flush=True)
+    print(f"[TFT Merged] After dropna: {before} -> {len(merged):,} rows", flush=True)
 
     os.makedirs(YEARLY_DIR, exist_ok=True)
     for year, group in merged.groupby(merged["time"].dt.year):
         path = os.path.join(YEARLY_DIR, f"{year}_tft_merged.csv")
         group.to_csv(path, index=False)
-        print(f"[TFT Merged] Saved yearly_merged/{year}_tft_merged.csv ({len(group):,} rows)", flush=True)
+        print(f"[TFT Merged] Saved yearly_merged/{year}_tft_merged.csv ({len(group):,} rows)",
+              flush=True)
     return merged
 
 
@@ -312,9 +335,9 @@ _MAX_WINDOW = 1440 * 50  # 50 days — enough warm-up for d1_ with tf_mult=1440
 def _update_current_year_features() -> dict:
     """
     Fast incremental update after new 1m candles are appended.
-    Loads the last _MAX_WINDOW rows (enough warm-up for all scaled windows),
-    recomputes all 6 rolling feature sets, then appends only new boundary rows
-    to the current year's bilstm_merged (15min boundaries) and tft_merged (4h boundaries).
+    Loads the last _MAX_WINDOW rows (enough warm-up for all indicator windows),
+    recomputes all 6 feature sets via proper resampling, then appends only new rows
+    to the current year's bilstm_merged and tft_merged CSVs.
     """
     if not os.path.exists(PATH_1M):
         return {"bilstm_added": 0, "tft_added": 0}
@@ -325,24 +348,18 @@ def _update_current_year_features() -> dict:
 
     tail = m1_full.tail(_MAX_WINDOW + 500).reset_index(drop=True)
 
-    feature_sets = [fn(tail, mult) for _, _, mult, fn in _TF_TASKS]
-
-    # Map label to computed DataFrame
-    feat_map = {label: feature_sets[i] for i, (_, label, _, _) in enumerate(_TF_TASKS)}
+    feature_sets = [fn(tail) for _, _, fn in _TF_TASKS]
+    feat_map = {label: feature_sets[i] for i, (_, label, _) in enumerate(_TF_TASKS)}
 
     year = pd.Timestamp.now(tz="UTC").year
     os.makedirs(YEARLY_DIR, exist_ok=True)
 
-    # ── BiLSTM merged update (15min boundaries) ───────────────────────────────
+    # ── BiLSTM merged update ──────────────────────────────────────────────────
     bilstm_added = 0
     feat_15m = feat_map["15m"]
     feat_1h  = feat_map["1H"]
-    feat_1m_close = feat_map["1m"][["time", "close"]] if "close" in feat_map["1m"].columns else None
 
-    bilstm_new = pd.merge(feat_15m, feat_1h, on="time", how="inner")
-    if feat_1m_close is not None:
-        bilstm_new = pd.merge(bilstm_new, feat_1m_close, on="time", how="inner")
-    bilstm_new = _at_15min_boundary(bilstm_new)
+    bilstm_new = _merge_asof_lower_tf(feat_15m, feat_1h, FEATURE_1H)
     bilstm_new = bilstm_new.dropna(subset=BILSTM_FEAT_COLS)
 
     bilstm_path = os.path.join(YEARLY_DIR, f"{year}_bilstm_merged.csv")
@@ -358,15 +375,12 @@ def _update_current_year_features() -> dict:
         bilstm_new.to_csv(bilstm_path, mode="a", header=write_header, index=False)
         bilstm_added = len(bilstm_new)
 
-    # ── TFT merged update (4h boundaries) ─────────────────────────────────────
+    # ── TFT merged update ─────────────────────────────────────────────────────
     tft_added = 0
     feat_4h = feat_map["4H"]
     feat_1d = feat_map["1D"]
 
-    tft_new = pd.merge(feat_4h, feat_1d, on="time", how="inner")
-    if feat_1m_close is not None:
-        tft_new = pd.merge(tft_new, feat_1m_close, on="time", how="inner")
-    tft_new = _at_4h_boundary(tft_new)
+    tft_new = _merge_asof_lower_tf(feat_4h, feat_1d, FEATURE_1D)
     tft_new = tft_new.dropna(subset=TFT_FEAT_COLS)
 
     tft_path = os.path.join(YEARLY_DIR, f"{year}_tft_merged.csv")
@@ -588,6 +602,21 @@ def _verify():
         today = pd.Timestamp.now(tz="UTC").date()
         chk("T7  Last row is today or recent", (today - last_date).days <= 2,
             f"{last_date} (today={today})")
+
+        # Variance guards: collapsed features indicate broken resampling.
+        # ATR-norm is a percent-of-price metric (range ~0-0.02), so its collapse
+        # threshold is much smaller than RSI/ADX (range 0-1).
+        _col_thresholds = {
+            "d1_rsi":      0.05,
+            "h4_rsi":      0.05,
+            "d1_adx":      0.05,
+            "h4_atr_norm": 0.001,   # ATR/price ∈ [0, 0.02]; std=0.006 is healthy
+        }
+        for col, min_std in _col_thresholds.items():
+            if col in tm.columns:
+                std_val = float(tm[col].std())
+                chk(f"T8  {col} std > {min_std} (not collapsed)", std_val > min_std,
+                    f"std={std_val:.4f}")
     else:
         print("  [FAIL] No tft_merged files found")
         fails += 1

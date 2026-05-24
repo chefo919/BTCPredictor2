@@ -31,9 +31,7 @@ import pandas as pd
 
 ROOT      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-from config import HORIZON_META as HORIZON, TFT_SAMPLE_INTERVAL
-
-HORIZON_ROWS = HORIZON // TFT_SAMPLE_INTERVAL  # 1440 min / 240 min-per-row = 6 rows (1 day)
+from config import HORIZON_META as HORIZON
 
 MODEL_DIR  = os.path.join(ROOT, "models", "saved")
 MODEL_PATH = os.path.join(MODEL_DIR, "meta_xgb.pkl")
@@ -59,6 +57,11 @@ GATE_MARKET_FEATURES = [
     "h4_adx",           # trend strength — key regime discriminator
     "d1_adx",           # 1D trend strength
     "h4_bb_width",      # 4H volatility regime
+    # NOTE: funding rate features (current_funding_rate, avg_funding_24h) are
+    # intentionally excluded here. Historical training data contains 0.0 stubs
+    # for these columns; adding them would cause XGBoost distribution shift at
+    # inference time when real Binance values arrive. Add once historical data
+    # is backfilled.
 ]
 
 
@@ -111,20 +114,12 @@ def train(val_df: pd.DataFrame,
     print(f"  Static fallback weights — TFT: {w_tft_n:.3f}  BiLSTM: {w_bilstm_n:.3f}",
           flush=True)
 
-    # ── Ground-truth direction ─────────────────────────────────────────────
-    val_df = val_df.copy()
-    val_df["actual"] = (val_df["close"].shift(-HORIZON_ROWS) > val_df["close"]).astype(int)
-    val_df = val_df.dropna(subset=["actual"]).reset_index(drop=True)
-
-    # val_tft_probs[i] predicts (close[i+HORIZON_ROWS] > close[i]) — same indexing as val_df.
-    # val_df after dropna keeps rows 0..n-HORIZON_ROWS (the last HORIZON_ROWS rows become NaN).
-    # So probs[:n_valid] aligns row-for-row with val_df. The original [-n_valid:] creates
-    # a 60-row temporal offset that misaligns TFT probs (which are non-0.5 only at
-    # every 60th row) with their corresponding targets.
-    n_valid    = len(val_df)
+    # ── Ground-truth direction (pre-applied triple-barrier labels) ────────────
+    val_df   = val_df.copy()
+    n_valid  = len(val_df)
     p_tft_v    = val_tft_probs[:n_valid].astype(np.float32)
     p_bilstm_v = val_bilstm_probs[:n_valid].astype(np.float32)
-    actual_v   = val_df["actual"].values
+    actual_v   = val_df["target"].values.astype(int)
 
     print(f"  Meta-learner training: {n_valid:,} rows  label balance: {actual_v.mean():.3f}",
           flush=True)

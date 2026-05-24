@@ -20,9 +20,9 @@ tf.get_logger().setLevel("ERROR")
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 from features.engineer import get_feature_groups, BILSTM_FEAT_COLS, TFT_FEAT_COLS
-from models.tft_model    import GRN, VSN, _StaticGRN, SEQ_LEN as SEQ_TFT
-from models.bilstm_model import _SumPool, _PVAttention, SEQ_LEN as SEQ_BILSTM
-from models import bilstm_model as _bilstm_mod, meta_model as _meta_mod
+from models.bilstm_model import SEQ_LEN as SEQ_BILSTM
+from models.tft_model    import SEQ_LEN as SEQ_TFT
+from models import tft_model as _tft_mod, bilstm_model as _bilstm_mod, meta_model as _meta_mod
 
 _groups           = get_feature_groups()
 BILSTM_FEATURES   = _groups["bilstm"]
@@ -41,8 +41,8 @@ import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from config import (FEE_RATE, STOP_LOSS_PCT, TAKE_PROFIT_PCT,
                     MIN_HOLD_MIN, MAX_HOLD_MIN,
-                    CHOP_FILTER_PCT, BUY_THRESHOLD, SELL_THRESHOLD, STARTING_USDT,
-                    TFT_SAMPLE_INTERVAL)
+                    CHOP_FILTER_PCT, STARTING_USDT, TFT_SAMPLE_INTERVAL,
+                    VOL_LOW_ATR, VOL_HIGH_ATR, THRESH_LOW_VOL, THRESH_HIGH_VOL)
 DEFAULT_CAPITAL = STARTING_USDT
 INFER_BATCH     = 128   # TFT attention [B,4,SEQ,SEQ] — 512 crashes A100
 
@@ -52,97 +52,63 @@ SEP = "=" * 46
 # ── Model loading ─────────────────────────────────────────────────────────────
 
 def _load_models():
-    tft_path    = os.path.join(MODELS_DIR, "tft.keras")
-    tft_s_path  = os.path.join(MODELS_DIR, "tft_scaler.pkl")
-    bi_path     = os.path.join(MODELS_DIR, "bilstm.keras")
-    bi_s_path   = os.path.join(MODELS_DIR, "bilstm_scaler.pkl")
-    meta_path   = os.path.join(MODELS_DIR, "meta_xgb.pkl")
-
-    for p in [tft_path, tft_s_path, bi_path, bi_s_path, meta_path]:
-        if not os.path.exists(p):
-            print(f"[Backtest] Model not found: {p}. Run: python training/train.py --force")
-            sys.exit(1)
-
-    print("[Backtest] Loading TFT-ACB-XML models...", flush=True)
-    tft_m    = tf.keras.models.load_model(tft_path,
-                   custom_objects={"GRN": GRN, "VSN": VSN, "_StaticGRN": _StaticGRN})
-    tft_s    = joblib.load(tft_s_path)
-    bilstm_m = tf.keras.models.load_model(bi_path,
-                   custom_objects={"_SumPool": _SumPool, "_PVAttention": _PVAttention})
-    bilstm_s = joblib.load(bi_s_path)
+    meta_path = os.path.join(MODELS_DIR, "meta_xgb.pkl")
+    if not _tft_mod.is_trained():
+        print("[Backtest] TFT ensemble not found. Run: python training/train.py --force")
+        sys.exit(1)
+    if not _bilstm_mod.is_trained():
+        print("[Backtest] BiLSTM ensemble not found. Run: python training/train.py --force")
+        sys.exit(1)
+    if not os.path.exists(meta_path):
+        print(f"[Backtest] Meta model not found: {meta_path}. Run: python training/train.py --force")
+        sys.exit(1)
 
     meta_saved = joblib.load(meta_path)
     meta_w   = meta_saved.get("static_weights", {"tft": 0.5, "bilstm": 0.5})
     has_gate = meta_saved.get("gate_model") is not None
     n_dis    = meta_saved.get("n_disagree", 0)
-    thresh   = meta_saved.get("agree_thresh", 0.10)
-    print(f"[Backtest] Models loaded — static weights TFT: {meta_w['tft']:.3f}  "
-          f"BiLSTM: {meta_w['bilstm']:.3f}  "
+    thresh   = meta_saved.get("agree_thresh", 0.06)
+    print(f"[Backtest] Models ready — TFT ensemble + BiLSTM ensemble  "
+          f"static weights TFT: {meta_w['tft']:.3f}  BiLSTM: {meta_w['bilstm']:.3f}  "
           f"gate: {'active' if has_gate else 'off'} "
-          f"({n_dis:,} training rows, thresh={thresh})", flush=True)
-    return tft_m, tft_s, bilstm_m, bilstm_s
+          f"({n_dis:,} rows, thresh={thresh})", flush=True)
 
 
 # ── Batch inference ───────────────────────────────────────────────────────────
 
-def _batch_infer(df_tft, df_bilstm, first_idx_tft, first_idx_bilstm,
-                  tft_m, tft_s, bilstm_m, bilstm_s):
+def _batch_infer(df_tft, df_bilstm, first_idx_tft, first_idx_bilstm):
     """
-    Run TFT inference on 4h-sampled tft_merged, BiLSTM inference on 15min-sampled
-    bilstm_merged, align results via merge_asof, then run meta-learner routing.
+    Run TFT ensemble inference on 4h-sampled tft_merged, BiLSTM ensemble inference on
+    15min-sampled bilstm_merged, align results via merge_asof, then run meta-learner routing.
     Returns final_probs array aligned to df_tft rows starting at first_idx_tft.
     """
-    n_tft    = len(df_tft) - first_idx_tft
     n_bilstm = len(df_bilstm) - first_idx_bilstm
 
-    # ── TFT inference ─────────────────────────────────────────────────────────
-    print("[Backtest] Running TFT inference...", flush=True)
-    X_tft_all = df_tft[TFT_DYN_FEATURES].values.astype(np.float32)
-    tft_sc    = tft_s.transform(X_tft_all).astype(np.float32)
-    tft_probs = np.full(n_tft, 0.5, dtype=np.float32)
-    n_batches = (n_tft + INFER_BATCH - 1) // INFER_BATCH
-    times_tft = df_tft["time"].values
-    last_pct  = -1
-    for b in range(n_batches):
-        b_start = b * INFER_BATCH
-        b_end   = min(b_start + INFER_BATCH, n_tft)
-        abs_idx = np.arange(first_idx_tft + b_start, first_idx_tft + b_end)
-        win_idx = abs_idx[:, None] + np.arange(-SEQ_TFT + 1, 1)[None, :]
-        preds   = tft_m.predict(tft_sc[win_idx], verbose=0, batch_size=INFER_BATCH)
-        tft_probs[b_start:b_end] = preds.flatten()
-        pct = int(b_end / n_tft * 50)
-        if pct // 10 > last_pct // 10:
-            row_ts = pd.Timestamp(times_tft[first_idx_tft + b_end - 1]).strftime("%b %Y")
-            print(f"[Backtest] TFT... {pct}% ({row_ts})", flush=True)
-            last_pct = pct
-    del tft_sc
+    # ── TFT inference (3-seed ensemble averaged internally) ───────────────────
+    print("[Backtest] Running TFT ensemble inference...", flush=True)
+    _ns_val  = 0
+    _ns_path = os.path.join(MODELS_DIR, "tft_n_static.txt")
+    if os.path.exists(_ns_path):
+        with open(_ns_path) as _f:
+            _ns_val = int(_f.read().strip() or "0")
+    X_dyn    = df_tft[TFT_DYN_FEATURES].values.astype(np.float32)
+    X_sta    = np.zeros((len(df_tft), _ns_val), dtype=np.float32)
+    _tft_all = _tft_mod.predict_proba_batch(X_dyn, X_sta,
+                                              timestamps=df_tft["time"],
+                                              batch_size=INFER_BATCH)
+    tft_probs = _tft_all[first_idx_tft:].astype(np.float32)
+    print("[Backtest] TFT inference complete.", flush=True)
 
-    # ── BiLSTM inference ──────────────────────────────────────────────────────
-    print("[Backtest] Running BiLSTM inference...", flush=True)
-    X_bi_all     = df_bilstm[BILSTM_FEATURES].values.astype(np.float32)
-    bilstm_sc    = bilstm_s.transform(X_bi_all).astype(np.float32)
-    bilstm_raw   = np.full(n_bilstm, 0.5, dtype=np.float32)
-    n_batches_bi = (n_bilstm + INFER_BATCH - 1) // INFER_BATCH
-    times_bi     = df_bilstm["time"].values
-    last_pct = -1
-    for b in range(n_batches_bi):
-        b_start = b * INFER_BATCH
-        b_end   = min(b_start + INFER_BATCH, n_bilstm)
-        abs_idx = np.arange(first_idx_bilstm + b_start, first_idx_bilstm + b_end)
-        win_idx = abs_idx[:, None] + np.arange(-SEQ_BILSTM + 1, 1)[None, :]
-        win_idx = np.clip(win_idx, 0, len(bilstm_sc) - 1)
-        preds   = bilstm_m.predict(bilstm_sc[win_idx], verbose=0, batch_size=INFER_BATCH)
-        bilstm_raw[b_start:b_end] = preds.flatten()
-        pct = 50 + int(b_end / n_bilstm * 40)
-        if pct // 10 > last_pct // 10:
-            row_ts = pd.Timestamp(times_bi[first_idx_bilstm + b_end - 1]).strftime("%b %Y")
-            print(f"[Backtest] BiLSTM... {pct}% ({row_ts})", flush=True)
-            last_pct = pct
-    del bilstm_sc
+    # ── BiLSTM inference (3-seed ensemble averaged internally) ────────────────
+    print("[Backtest] Running BiLSTM ensemble inference...", flush=True)
+    X_bi_all = df_bilstm[BILSTM_FEATURES].values.astype(np.float32)
+    _bi_all  = _bilstm_mod.predict_proba_batch(X_bi_all, batch_size=INFER_BATCH)
+    bilstm_raw = _bi_all[first_idx_bilstm:].astype(np.float32)
+    print("[Backtest] BiLSTM inference complete.", flush=True)
 
     # ── Align bilstm probs onto tft timestamps ────────────────────────────────
-    tft_times_active = pd.DatetimeIndex(times_tft[first_idx_tft:])
-    bi_times_active  = pd.DatetimeIndex(times_bi[first_idx_bilstm:])
+    tft_times_active = pd.DatetimeIndex(df_tft["time"].values[first_idx_tft:])
+    bi_times_active  = pd.DatetimeIndex(df_bilstm["time"].values[first_idx_bilstm:])
     _df_bi_p  = pd.DataFrame({"time": bi_times_active,  "p_bi": bilstm_raw})
     _df_tft_t = pd.DataFrame({"time": tft_times_active})
     _aligned  = pd.merge_asof(_df_tft_t.sort_values("time"),
@@ -170,12 +136,31 @@ def _batch_infer(df_tft, df_bilstm, first_idx_tft, first_idx_bilstm,
     return final_probs
 
 
+# ── Dynamic thresholds (Fix 5) ────────────────────────────────────────────────
+
+def _dynamic_thresholds(atr_pct: float) -> tuple:
+    """Buy threshold scales inversely with ATR; sell_t = 1 - buy_t."""
+    if atr_pct <= VOL_LOW_ATR:
+        buy_t = THRESH_LOW_VOL
+    elif atr_pct >= VOL_HIGH_ATR:
+        buy_t = THRESH_HIGH_VOL
+    else:
+        t = (atr_pct - VOL_LOW_ATR) / (VOL_HIGH_ATR - VOL_LOW_ATR)
+        buy_t = THRESH_LOW_VOL + t * (THRESH_HIGH_VOL - THRESH_LOW_VOL)
+    return buy_t, 1.0 - buy_t
+
+
 # ── Trade simulation ──────────────────────────────────────────────────────────
 
 def _simulate(df, first_idx, tft_probs, starting_capital):
     closes    = df["close"].values.astype(np.float64)
     times_arr = df["time"].values
     n         = len(df) - first_idx
+
+    # h4_atr_norm for dynamic thresholds; zero-filled if column absent (backtest stub)
+    atr_arr = (df["h4_atr_norm"].values.astype(np.float64)
+               if "h4_atr_norm" in df.columns
+               else np.zeros(len(df)))
 
     # Pre-compute hourly chop filter
     close_s  = pd.Series(closes)
@@ -236,11 +221,12 @@ def _simulate(df, first_idx, tft_probs, starting_capital):
         score = float(tft_probs[step])
         value_history.append(usdt + btc * price)
 
-        # ── Signal ────────────────────────────────────────────────────────────
-        if score > BUY_THRESHOLD:
+        # ── Signal with dynamic thresholds (Fix 5) ───────────────────────────
+        buy_t, sell_t = _dynamic_thresholds(float(atr_arr[abs_i]))
+        if score > buy_t:
             signal = "BUY"
             conf   = "HIGH" if score > 0.75 else "MEDIUM"
-        elif score < SELL_THRESHOLD:
+        elif score < sell_t:
             signal = "SELL"
             conf   = "HIGH" if score < 0.25 else "MEDIUM"
         else:
@@ -519,10 +505,9 @@ def main():
     n = len(df_tft) - first_idx_tft
     print(f"[Backtest] {n:,} TFT rows to process", flush=True)
 
-    tft_m, tft_s, bilstm_m, bilstm_s = _load_models()
+    _load_models()
 
-    final_probs = _batch_infer(df_tft, df_bilstm, first_idx_tft, first_idx_bilstm,
-                                tft_m, tft_s, bilstm_m, bilstm_s)
+    final_probs = _batch_infer(df_tft, df_bilstm, first_idx_tft, first_idx_bilstm)
 
     print("[Backtest] Simulating trades...", flush=True)
     result = _simulate(df_tft, first_idx_tft, final_probs, args.capital)

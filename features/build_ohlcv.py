@@ -77,6 +77,10 @@ def _aggregate_floor(df: pd.DataFrame, freq: str) -> pd.DataFrame:
     return agg[agg["volume"] > 0].reset_index(drop=True)
 
 
+# Public alias — used by features/engineer.py for proper timeframe resampling
+aggregate_floor = _aggregate_floor
+
+
 def _aggregate_grouper(df: pd.DataFrame, freq: str) -> pd.DataFrame:
     """
     Aggregate OHLCV using pd.Grouper for calendar-aligned weekly/monthly.

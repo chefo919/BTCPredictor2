@@ -20,7 +20,9 @@ from data_manager import update_data
 from features.engineer import (BILSTM_FEAT_COLS, TFT_FEAT_COLS,
                                 get_feature_groups, update_features)
 from models import tft_model, bilstm_model, meta_model
-from config import BUY_THRESHOLD, SELL_THRESHOLD, SEQ_LEN_TFT, SEQ_LEN_BILSTM
+from config import (BUY_THRESHOLD, SELL_THRESHOLD, SEQ_LEN_TFT, SEQ_LEN_BILSTM,
+                    VOL_LOW_ATR, VOL_HIGH_ATR, THRESH_LOW_VOL, THRESH_HIGH_VOL)
+from features.funding import get_funding_features
 
 ROOT       = os.path.dirname(os.path.dirname(__file__))
 YEARLY_DIR = os.path.join(ROOT, "data", "yearly_merged")
@@ -93,6 +95,24 @@ def _load_tft_tail(n: int) -> pd.DataFrame:
     return df
 
 
+def _dynamic_thresholds(atr_pct: float) -> tuple:
+    """
+    Buy threshold scales inversely with ATR:
+      quiet (< VOL_LOW_ATR)   → THRESH_LOW_VOL (require strong signal)
+      volatile (> VOL_HIGH_ATR) → THRESH_HIGH_VOL (fee easily outpaced)
+      between              → linear interpolation
+    sell_t = 1 - buy_t (symmetric).
+    """
+    if atr_pct <= VOL_LOW_ATR:
+        buy_t = THRESH_LOW_VOL
+    elif atr_pct >= VOL_HIGH_ATR:
+        buy_t = THRESH_HIGH_VOL
+    else:
+        t = (atr_pct - VOL_LOW_ATR) / (VOL_HIGH_ATR - VOL_LOW_ATR)
+        buy_t = THRESH_LOW_VOL + t * (THRESH_HIGH_VOL - THRESH_LOW_VOL)
+    return buy_t, 1.0 - buy_t
+
+
 def _market_context(tft_row: pd.Series, bilstm_row: pd.Series) -> list:
     items = []
     for tf, rsi_col, macd_col, row in [
@@ -139,21 +159,28 @@ def generate_signal(fetch: bool = True) -> dict:
     X_sta = df_tft[TFT_STA_FEATURES].values if TFT_STA_FEATURES else np.zeros((len(df_tft), 0))
     X_bi  = df_bilstm[BILSTM_FEATURES].values
 
-    p_tft    = tft_model.predict_proba(X_dyn, X_sta)
+    p_tft    = tft_model.predict_proba(X_dyn, X_sta, timestamps=df_tft["time"])
     p_bilstm = bilstm_model.predict_proba(X_bi)
 
+    # Funding rate context for gate (zero-latency API fetch)
+    funding = get_funding_features()
+
     if meta_model.is_trained():
-        # Combine last TFT and BiLSTM rows into a single gate snapshot
-        gate_snapshot = pd.concat([last_tft_row, last_bilstm_row])
+        gate_snapshot = pd.concat([last_tft_row, last_bilstm_row,
+                                    pd.Series(funding)])
         final_score   = meta_model.predict_proba(p_tft, p_bilstm, gate_snapshot,
                                                   ALL_GATE_FEATURES)
     else:
         final_score = (p_tft + p_bilstm) / 2.0
 
-    if final_score > BUY_THRESHOLD:
+    # Dynamic thresholds scaled to current ATR regime (Fix 5)
+    atr_pct   = float(last_tft_row.get("h4_atr_norm", 0.006))
+    buy_t, sell_t = _dynamic_thresholds(atr_pct)
+
+    if final_score > buy_t:
         signal = "BUY"
         conf   = "HIGH" if final_score > 0.75 else "MEDIUM"
-    elif final_score < SELL_THRESHOLD:
+    elif final_score < sell_t:
         signal = "SELL"
         conf   = "HIGH" if final_score < 0.25 else "MEDIUM"
     else:
@@ -161,16 +188,20 @@ def generate_signal(fetch: bool = True) -> dict:
         conf   = "LOW"
 
     return {
-        "signal_time": now,
-        "last_candle": last_candle,
-        "lag_minutes": lag_minutes,
-        "price":       current_price,
-        "tft_prob":    p_tft,
-        "bilstm_prob": p_bilstm,
-        "final_score": final_score,
-        "signal":      signal,
-        "confidence":  conf,
-        "context":     _market_context(last_tft_row, last_bilstm_row),
+        "signal_time":    now,
+        "last_candle":    last_candle,
+        "lag_minutes":    lag_minutes,
+        "price":          current_price,
+        "tft_prob":       p_tft,
+        "bilstm_prob":    p_bilstm,
+        "final_score":    final_score,
+        "signal":         signal,
+        "confidence":     conf,
+        "buy_threshold":  buy_t,
+        "sell_threshold": sell_t,
+        "h4_atr_norm":    atr_pct,
+        "funding_rate":   funding.get("current_funding_rate", 0.0),
+        "context":        _market_context(last_tft_row, last_bilstm_row),
     }
 
 

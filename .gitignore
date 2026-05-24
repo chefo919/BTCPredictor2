@@ -4,6 +4,7 @@ data/btc_*.csv
 data/backups/
 data/manifest.json
 # data/yearly_merged/ is NOT ignored — 10 CSVs (~90 MB) committed for Colab training
+# data/yearly_1m/ is NOT ignored — 5 yearly 1m splits (~150 MB) committed for Colab labels
 
 # ── Trained model weights (binary, too large for git) ────────────────────────
 models/saved/*.keras

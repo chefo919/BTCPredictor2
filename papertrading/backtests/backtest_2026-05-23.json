@@ -1,0 +1,29 @@
+{
+  "period": {
+    "start": "2026-04-15",
+    "end": "2026-05-23"
+  },
+  "performance": {
+    "final_val": 1000.0,
+    "total_pnl": 0.0,
+    "total_pnl_pct": 0.0,
+    "max_drawdown": 0.0,
+    "sharpe": 0.0
+  },
+  "trades_summary": {
+    "total_trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "win_rate": 0,
+    "avg_hold": 0
+  },
+  "exit_reasons": {
+    "STOP_LOSS": 0,
+    "TAKE_PROFIT": 0,
+    "MAX_HOLD": 0,
+    "SIGNAL": 0,
+    "END_OF_BACKTEST": 0
+  },
+  "monthly": {},
+  "trades": []
+}

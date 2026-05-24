@@ -24,7 +24,8 @@ sys.path.insert(0, ROOT)
 from config import (SEQ_LEN_BILSTM as SEQ_LEN, HORIZON_BILSTM as HORIZON,
                     N_EPOCHS_BILSTM as N_EPOCHS, BATCH_BILSTM as BATCH,
                     STRIDE_BILSTM as STRIDE, DROPOUT_BILSTM as DROPOUT,
-                    N_ENSEMBLE, BILSTM_SAMPLE_INTERVAL, LSTM_UNITS_BILSTM)
+                    N_ENSEMBLE, BILSTM_SAMPLE_INTERVAL, LSTM_UNITS_BILSTM,
+                    EXP_WEIGHT_HALFLIFE)
 
 HORIZON_ROWS = HORIZON // BILSTM_SAMPLE_INTERVAL  # 1440 min / 15 min-per-row = 96 rows (1 day)
 
@@ -138,6 +139,38 @@ def _custom_objects():
     return {"_SumPool": _SumPool, "_PVAttention": _PVAttention}
 
 
+def _compute_exp_weights(n: int, y: np.ndarray,
+                          halflife_frac: float = EXP_WEIGHT_HALFLIFE) -> np.ndarray:
+    """Exp decay weights × class correction, normalized to mean=1."""
+    lam   = np.log(2) / (halflife_frac * n)
+    exp_w = np.exp(-lam * (n - 1 - np.arange(n)))
+    pos   = float(y.mean())
+    neg   = 1.0 - pos
+    cf    = np.where(y == 1, 1.0 / (2.0 * max(pos, 1e-6)),
+                              1.0 / (2.0 * max(neg, 1e-6)))
+    combined = (exp_w * cf).astype(np.float32)
+    return combined / combined.mean()
+
+
+def _make_weighted_train_ds(X_sc: np.ndarray, y: np.ndarray, w: np.ndarray,
+                             seq_len: int, stride: int,
+                             batch_size: int) -> "tf.data.Dataset":
+    """(X_seq, y, w) 3-tuple training dataset — supports sample_weight in model.fit."""
+    n      = len(X_sc)
+    starts = np.arange(0, n - seq_len, stride, dtype=np.int32)
+    tgts   = y[starts + seq_len].astype(np.float32)
+    wts    = w[starts + seq_len - 1].astype(np.float32)
+    X_tf   = tf.constant(X_sc, dtype=tf.float32)
+    ds     = tf.data.Dataset.from_tensor_slices((starts, tgts, wts))
+    ds     = ds.shuffle(buffer_size=min(len(starts), 10000),
+                        reshuffle_each_iteration=True)
+    def _extract(start, tgt, wt):
+        return tf.slice(X_tf, [start, 0], [seq_len, -1]), tgt, wt
+    return (ds.map(_extract, num_parallel_calls=tf.data.AUTOTUNE)
+              .batch(batch_size)
+              .prefetch(tf.data.AUTOTUNE))
+
+
 def build_model(n_features: int, units: int = None,
                 dropout_rate: float = None) -> tf.keras.Model:
     units        = units        if units        is not None else LSTM_UNITS_BILSTM
@@ -189,8 +222,8 @@ def train(feature_df, feature_cols: list, seed: int = None,
     t0 = time.time()
 
     df = feature_df.dropna(subset=feature_cols).copy()
-    df["target"] = (df["close"].shift(-HORIZON_ROWS) > df["close"]).astype(int)
-    df = df.dropna(subset=["target"])
+    if "target" not in df.columns:
+        raise RuntimeError("target column missing — call apply_triple_barrier in train.py first")
     print(f"  BiLSTM training rows: {len(df):,}  label balance: {df['target'].mean():.3f}",
           flush=True)
 
@@ -201,22 +234,14 @@ def train(feature_df, feature_cols: list, seed: int = None,
     train_end = int(n * 0.70)
     val_end   = int(n * 0.85)
 
-    recent_start = int(train_end * 0.75)
-    X_tr_aug = np.concatenate([X[:train_end], X[recent_start:train_end]])
-    y_tr_aug = np.concatenate([y[:train_end], y[recent_start:train_end]])
-    perm     = np.random.permutation(len(X_tr_aug))
-    X_tr_aug = X_tr_aug[perm]
-    y_tr_aug = y_tr_aug[perm]
-    print(f"  Recency augmentation: {train_end:,} → {len(X_tr_aug):,} rows", flush=True)
-
-    pos = float(y_tr_aug.mean())
-    neg = 1.0 - pos
-    class_weight = {0: round(1.0 / (2.0 * max(neg, 1e-6)), 4),
-                    1: round(1.0 / (2.0 * max(pos, 1e-6)), 4)}
-    print(f"  Class weights: down={class_weight[0]:.3f}  up={class_weight[1]:.3f}", flush=True)
+    # Exponential decay weights (Fix 3) — replaces recency augmentation
+    y_tr = y[:train_end]
+    w_tr = _compute_exp_weights(train_end, y_tr)
+    print(f"  Exp sample weights: halflife={EXP_WEIGHT_HALFLIFE:.0%} of train  "
+          f"label={y_tr.mean():.3f}", flush=True)
 
     scaler  = StandardScaler()
-    X_train = scaler.fit_transform(X_tr_aug).astype(np.float32)
+    X_train = scaler.fit_transform(X[:train_end]).astype(np.float32)
     X_val   = scaler.transform(X[train_end:val_end]).astype(np.float32)
     X_test  = scaler.transform(X[val_end:]).astype(np.float32)
 
@@ -230,10 +255,9 @@ def train(feature_df, feature_cols: list, seed: int = None,
             shuffle=shuffle,
         ).prefetch(tf.data.AUTOTUNE)
 
-    n_aug    = len(X_train)
-    train_ds = make_ds(X_train, y_tr_aug, 0, n_aug, shuffle=True)
-    val_ds   = make_ds(X_val,   y, train_end, val_end)
-    test_ds  = make_ds(X_test,  y, val_end, n)
+    train_ds = _make_weighted_train_ds(X_train, y_tr, w_tr, SEQ_LEN, STRIDE, BATCH)
+    val_ds   = make_ds(X_val,  y, train_end, val_end)
+    test_ds  = make_ds(X_test, y, val_end, n)
 
     os.makedirs(_ckpt_dir, exist_ok=True)
     ckpt_path, start_epoch = _latest_checkpoint(_ckpt_dir)
@@ -303,7 +327,7 @@ def train(feature_df, feature_cols: list, seed: int = None,
 
     history = model.fit(train_ds, validation_data=val_ds,
                         epochs=N_EPOCHS, initial_epoch=start_epoch,
-                        callbacks=callbacks, class_weight=class_weight, verbose=0)
+                        callbacks=callbacks, verbose=0)
 
     val_acc  = max(history.history.get("val_accuracy", [0.5]))
     _, test_acc = model.evaluate(test_ds, verbose=0)

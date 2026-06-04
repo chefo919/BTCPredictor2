@@ -7,7 +7,7 @@ Input data comes pre-sampled at 4-hour boundaries from {YYYY}_tft_merged.csv,
 so no internal downsampling is needed.
 
 Architecture: true TFT with VSN on past+future, encoder-decoder LSTM,
-GRN gated skips, temporal self-attention over [past; future], quantile heads.
+GRN gated skips, temporal self-attention over [past; future], sigmoid head.
 """
 import os, sys
 import numpy as np
@@ -112,41 +112,14 @@ class _LSTMDecoder(tf.keras.layers.Layer):
         return cfg
 
 
-class _Q50Accuracy(tf.keras.metrics.Metric):
-    """Binary accuracy using the q50 head (column 1 of the 3-quantile output)."""
-    def __init__(self, **kwargs):
-        super().__init__(name="q50_acc", **kwargs)
-        self._total   = self.add_weight(name="total",   shape=(), initializer="zeros")
-        self._correct = self.add_weight(name="correct", shape=(), initializer="zeros")
-
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        q50   = y_pred[:, 1]
-        pred  = tf.cast(q50 > 0.5, tf.int32)
-        true_ = tf.cast(tf.reshape(y_true, (-1,)) > 0.5, tf.int32)
-        n_ok  = tf.cast(tf.reduce_sum(tf.cast(pred == true_, tf.float32)), tf.float32)
-        self._total.assign_add(tf.cast(tf.shape(y_pred)[0], tf.float32))
-        self._correct.assign_add(n_ok)
-
-    def result(self):
-        return self._correct / (self._total + 1e-7)
-
-    def reset_state(self):
-        self._total.assign(0.0)
-        self._correct.assign(0.0)
+class _ExtractLast(tf.keras.layers.Layer):
+    """Extracts the last timestep: [B, T, D] -> [B, D]. Replaces Lambda for safe serialization."""
+    def call(self, x):
+        return x[:, -1, :]
 
     def get_config(self):
         return super().get_config()
 
-
-def _pinball_loss(quantiles=(0.1, 0.5, 0.9)):
-    """Pinball/quantile loss summed over three heads. y_true: scalar, y_pred: [B, 3]."""
-    qs = tf.constant(list(quantiles), dtype=tf.float32)
-    def loss(y_true, y_pred):
-        y = tf.cast(tf.reshape(y_true, (-1, 1)), tf.float32)
-        e = y - y_pred
-        return tf.reduce_mean(tf.maximum(qs * e, (qs - 1.0) * e))
-    loss.__name__ = "pinball_loss"
-    return loss
 
 
 def encode_time_features(timestamps: "pd.Series",
@@ -204,7 +177,7 @@ def _make_tft_ds(X_sc: np.ndarray, X_time: np.ndarray, y_arr: np.ndarray,
 def build_model(n_dynamic: int, n_static: int = 0,
                 d_model: int = None, dropout_rate: float = None) -> tf.keras.Model:
     """
-    True Temporal Fusion Transformer (Lim et al. 2021).
+    True Temporal Fusion Transformer (Lim et al. 2021) — binary classification variant.
 
     Architecture:
       1. VSN on BOTH past and future inputs
@@ -213,10 +186,11 @@ def build_model(n_dynamic: int, n_static: int = 0,
       4. Temporal SELF-attention over full [past_enriched; fut_enriched] context (SEQ_LEN+1 steps)
       5. GRN gated skip after attention; GRN position-wise FFN
       6. Extract LAST position (future step) from output
-      7. Three quantile heads → [B, 3]  (q10, q50, q90)
+      7. Single sigmoid head → scalar p ∈ [0, 1]
 
     Two inputs: past_inp [B, SEQ_LEN, n_dynamic], fut_inp [B, 1, 6].
-    Output: [B, 3].  Trained with pinball loss.
+    Output: [B, 1].  Trained with binary_crossentropy.
+    Comparable to BiLSTM sigmoid output — enables direct meta-learner blending.
     n_static is accepted but unused (no static covariate path in current data).
     """
     from tensorflow.keras import models
@@ -264,13 +238,10 @@ def build_model(n_dynamic: int, n_static: int = 0,
         GRN(dm, dr, name="grn_ffn")(attn_enriched) + attn_enriched)  # [B, SEQ_LEN+1, dm]
 
     # ── 6. Extract LAST position (future decoder step) ───────────────────────
-    x = layers.Lambda(lambda t: t[:, -1, :], name="extract_future")(ffn_enriched)  # [B, dm]
+    x = _ExtractLast(name="extract_future")(ffn_enriched)  # [B, dm]
 
-    # ── 7. Three quantile heads ───────────────────────────────────────────────
-    q10 = layers.Dense(1, name="q10")(x)
-    q50 = layers.Dense(1, name="q50")(x)
-    q90 = layers.Dense(1, name="q90")(x)
-    out = layers.Concatenate(name="quantiles")([q10, q50, q90])       # [B, 3]
+    # ── 7. Single sigmoid output head ────────────────────────────────────────
+    out = layers.Dense(1, activation="sigmoid", name="output")(x)    # [B, 1]
 
     model = models.Model([past_inp, fut_inp], out, name="tft")
     return model
@@ -318,7 +289,7 @@ def _latest_checkpoint(ckpt_dir=None) -> tuple:
 
 def _custom_objects():
     return {"GRN": GRN, "VSN": VSN, "_LSTMDecoder": _LSTMDecoder,
-            "_Q50Accuracy": _Q50Accuracy}
+            "_ExtractLast": _ExtractLast}
 
 
 # Diverse per-seed hyperparameters — architectural variation improves ensemble signal coverage
@@ -437,8 +408,8 @@ def train(feature_df, dynamic_cols: list, static_cols: list,
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(lr_schedule, clipnorm=1.0),
-        loss=_pinball_loss(),
-        metrics=[_Q50Accuracy()],
+        loss="binary_crossentropy",
+        metrics=["binary_accuracy"],
     )
 
     BAR = 36
@@ -460,8 +431,8 @@ def train(feature_df, dynamic_cols: list, static_cols: list,
                 f"  Epoch {done:3d}/{N_EPOCHS} [{bar}] | "
                 f"Loss: {logs.get('loss',0):.4f} | "
                 f"Val Loss: {logs.get('val_loss',0):.4f} | "
-                f"q50 acc: {logs.get('q50_acc',0):.3f} | "
-                f"Val q50: {logs.get('val_q50_acc',0):.3f} | "
+                f"Acc: {logs.get('binary_accuracy',0):.3f} | "
+                f"Val Acc: {logs.get('val_binary_accuracy',0):.3f} | "
                 f"Elapsed: {_fmt(elapsed)} | ETA: {_fmt(eta)}",
                 flush=True,
             )
@@ -477,15 +448,15 @@ def train(feature_df, dynamic_cols: list, static_cols: list,
                         epochs=N_EPOCHS, initial_epoch=start_epoch,
                         callbacks=callbacks, verbose=0)
 
-    val_acc = max(history.history.get("val_q50_acc", [0.5]))
+    val_acc = max(history.history.get("val_binary_accuracy", [0.5]))
 
-    # Test accuracy from q50 head
-    raw_test = model.predict(test_ds, verbose=0)    # [N_seqs, 3]
-    q50_test = raw_test[:, 1]
-    n_test_seqs = len(q50_test)
+    # Test accuracy from sigmoid head
+    raw_test    = model.predict(test_ds, verbose=0)    # [N_seqs, 1]
+    prob_test   = raw_test[:, 0]
+    n_test_seqs = len(prob_test)
     y_test_aligned = y[val_end + SEQ_LEN : val_end + SEQ_LEN + n_test_seqs * STRIDE : STRIDE]
     y_test_aligned = y_test_aligned[:n_test_seqs]
-    test_acc = float(np.mean((q50_test > 0.5).astype(int) == y_test_aligned))
+    test_acc = float(np.mean((prob_test > 0.5).astype(int) == y_test_aligned))
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     model.save(_model_path)
@@ -523,7 +494,7 @@ def train_ensemble(feature_df, dynamic_cols: list, static_cols: list) -> list:
 def _infer_batch(model, scaler, X_dynamic, timestamps, batch_size):
     """
     Batch inference for one TFT model.
-    Returns q50 probabilities (float32 array, same length as X_dynamic).
+    Returns sigmoid probabilities (float32 array, same length as X_dynamic).
     timestamps: pd.Series or array-like of UTC timestamps for X_dynamic rows.
     """
     X_sc = scaler.transform(X_dynamic).astype(np.float32)
@@ -545,11 +516,9 @@ def _infer_batch(model, scaler, X_dynamic, timestamps, batch_size):
         win_idx    = abs_idx[:, None] + np.arange(-SEQ_LEN + 1, 1)[None, :]
         past_batch = X_sc[win_idx]                       # [B, SEQ_LEN, n_dyn]
         fut_batch  = X_time[abs_idx][:, np.newaxis, :]  # [B, 1, 6]
-        raw        = model.predict([past_batch, fut_batch], verbose=0,
-                                    batch_size=batch_size)  # [B, 3]
-        # Anti-crossing clamp
-        q50 = np.clip(raw[:, 1], raw[:, 0], raw[:, 2])
-        probs[SEQ_LEN + b_start: SEQ_LEN + b_end] = q50
+        raw   = model.predict([past_batch, fut_batch], verbose=0,
+                               batch_size=batch_size)  # [B, 1]
+        probs[SEQ_LEN + b_start: SEQ_LEN + b_end] = raw[:, 0]
     return probs
 
 
@@ -577,7 +546,7 @@ def predict_proba_batch(X_dynamic: np.ndarray, X_static: np.ndarray,
 def predict_proba(X_dynamic: np.ndarray, X_static: np.ndarray,
                   timestamps=None) -> float:
     """
-    Single-sample inference. Returns q50 as a scalar probability.
+    Single-sample inference. Returns sigmoid probability p ∈ [0, 1].
     X_dynamic must have at least SEQ_LEN rows (already 4h-sampled).
     timestamps: optional pd.Series or array for decoder future input;
                 if None, uses current UTC time.
@@ -598,47 +567,27 @@ def predict_proba(X_dynamic: np.ndarray, X_static: np.ndarray,
             m  = tf.keras.models.load_model(_seed_model_path(s), custom_objects=_custom_objects())
             sc = joblib.load(_seed_scaler_path(s))
             past = sc.transform(X_h).astype(np.float32).reshape(1, SEQ_LEN, -1)
-            raw  = m.predict([past, fut], verbose=0)  # [1, 3]
-            preds.append(float(np.clip(raw[0, 1], raw[0, 0], raw[0, 2])))
+            raw  = m.predict([past, fut], verbose=0)  # [1, 1]
+            preds.append(float(raw[0, 0]))
             del m
         return float(np.mean(preds))
 
     model  = tf.keras.models.load_model(MODEL_PATH, custom_objects=_custom_objects())
     scaler = joblib.load(SCALER_PATH)
     past   = scaler.transform(X_h).astype(np.float32).reshape(1, SEQ_LEN, -1)
-    raw    = model.predict([past, fut], verbose=0)
-    return float(np.clip(raw[0, 1], raw[0, 0], raw[0, 2]))
+    raw    = model.predict([past, fut], verbose=0)  # [1, 1]
+    return float(raw[0, 0])
 
 
 def predict_uncertainty(X_dynamic: np.ndarray, X_static: np.ndarray,
                          timestamps=None) -> tuple:
-    """Returns (q10, q50, q90) for uncertainty-aware signal generation (Fix 5)."""
-    X_h = X_dynamic[-SEQ_LEN:]
-
-    if timestamps is not None:
-        last_ts = pd.Series(timestamps).iloc[-1:]
-        fut_feat = encode_time_features(last_ts)
-    else:
-        fut_feat = encode_time_features(pd.Series([pd.Timestamp.now(tz="UTC")]))
-    fut = fut_feat[np.newaxis, :, :]
-
-    if _ensemble_ready():
-        qs_list = []
-        for s in range(N_ENSEMBLE):
-            m  = tf.keras.models.load_model(_seed_model_path(s), custom_objects=_custom_objects())
-            sc = joblib.load(_seed_scaler_path(s))
-            past = sc.transform(X_h).astype(np.float32).reshape(1, SEQ_LEN, -1)
-            raw  = m.predict([past, fut], verbose=0)[0]  # [3]
-            qs_list.append(raw)
-            del m
-        avg = np.mean(qs_list, axis=0)
-        return (float(avg[0]), float(np.clip(avg[1], avg[0], avg[2])), float(avg[2]))
-
-    model  = tf.keras.models.load_model(MODEL_PATH, custom_objects=_custom_objects())
-    scaler = joblib.load(SCALER_PATH)
-    past   = scaler.transform(X_h).astype(np.float32).reshape(1, SEQ_LEN, -1)
-    raw    = model.predict([past, fut], verbose=0)[0]
-    return (float(raw[0]), float(np.clip(raw[1], raw[0], raw[2])), float(raw[2]))
+    """
+    Returns (low, mid, high) probability bounds for uncertainty-aware callers.
+    Binary classification has no true quantile uncertainty, so returns
+    (p, p, p) — callers that used q10/q50/q90 still receive a valid mid value.
+    """
+    p = predict_proba(X_dynamic, X_static, timestamps)
+    return (p, p, p)
 
 
 def is_trained() -> bool:

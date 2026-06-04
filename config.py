@@ -37,6 +37,13 @@ STRIDE_BILSTM     = 4     # 1 sample per hour = every 4 steps in 15min-sampled d
 TRAINING_CUTOFF_DATE = "2026-04-15"
 EXP_WEIGHT_HALFLIFE  = 0.33    # fraction of train set back from end where weight = 0.5
 
+# ── OOF purge windows (must cover MAX_HOLD_MIN to prevent label leakage) ──────
+# MAX_HOLD_MIN = 4320 min = 3 days; 72h purge is the safe minimum.
+# 72h / 4h-per-row = 18 rows in tft_merged (4h-sampled)
+# 72h × 4 rows-per-hour = 288 rows in bilstm_merged (15min-sampled)
+PURGE_ROWS_TFT    = 18    # 72h purge gap for 4h-sampled OOF split
+PURGE_ROWS_BILSTM = 288   # 72h purge gap for 15min-sampled OOF split
+
 # ── Trading signals ───────────────────────────────────────────────────────────
 BUY_THRESHOLD  = 0.54   # static fallback (overridden by _dynamic_thresholds when h4_atr_norm available)
 SELL_THRESHOLD = 0.46
